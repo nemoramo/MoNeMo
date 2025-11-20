@@ -191,6 +191,40 @@ def _prepare_audio_source(audio_reference):
     return audio_obj, audio_path, audio_suffix
 
 
+def _download_audio_from_s3(audio_path: str):
+    try:
+        from nemo.utils.s3_utils import S3Utils
+    except ModuleNotFoundError as exc:
+        raise ModuleNotFoundError(
+            "Reading audio files from s3:// paths requires the optional S3 dependencies (boto3[crt], "
+            "s3fs==0.4.2, tenacity). Please install them as documented in docs/source/common/s3_checkpointing.rst."
+        ) from exc
+
+    return S3Utils.download_s3_file_to_stream(audio_path)
+
+
+def _prepare_audio_source(audio_reference):
+    """Return a tuple of (object to read audio from, original path if available, lowercase suffix)."""
+
+    audio_obj = audio_reference
+    audio_path = None
+
+    if isinstance(audio_reference, os.PathLike):
+        audio_reference = os.fspath(audio_reference)
+        audio_obj = audio_reference
+
+    if isinstance(audio_reference, str):
+        audio_path = audio_reference
+        if is_s3_url(audio_reference):
+            audio_obj = _download_audio_from_s3(audio_reference)
+    else:
+        audio_path = getattr(audio_reference, 'name', None)
+
+    audio_suffix = os.path.splitext(audio_path)[-1].lower() if audio_path else ''
+
+    return audio_obj, audio_path, audio_suffix
+
+
 def select_channels(signal: npt.NDArray, channel_selector: Optional[ChannelSelectorType] = None) -> npt.NDArray:
     """
     Convert a multi-channel signal to a single-channel signal by averaging over channels or
