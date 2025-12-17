@@ -202,6 +202,15 @@ class DistributedLengthBudgetBatchSampler(Sampler[List[int]]):
 
         if self.drop_last:
             usable = (num_batches // self.world_size) * self.world_size
+
+            # Guard against silently dropping everything when drop_last=True
+            if usable == 0:
+                raise ValueError(
+                    "DistributedLengthBudgetBatchSampler(drop_last=True) would drop all batches because "
+                    f"num_batches({num_batches}) < world_size({self.world_size}). "
+                    "Set drop_last=False (will pad), or increase dataset size / length_budget / max_batch_size."
+                )
+
             batch_indices = batch_indices[:usable]
             steps = usable // self.world_size
         else:

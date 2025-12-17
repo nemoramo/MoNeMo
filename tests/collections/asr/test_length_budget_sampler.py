@@ -249,3 +249,24 @@ def test_length_budget_sampler_rejects_iterable_dataset():
 
     with pytest.raises(ValueError):
         get_length_budget_batch_sampler(_DummyModel(), _DummyIterable(), {"length_budget": 5.0})
+
+
+@pytest.mark.unit
+def test_distributed_length_budget_sampler_drop_last_raises_when_all_batches_would_be_dropped():
+    """Test that drop_last=True raises ValueError when num_batches < world_size."""
+    lengths = [1.0, 1.0]  # each becomes its own batch if budget is very small
+    sampler = DistributedLengthBudgetBatchSampler(
+        lengths=lengths,
+        length_budget=0.5,
+        world_size=4,
+        rank=0,
+        shuffle=False,
+        seed=0,
+        drop_last=True,
+        balance_across_ranks=True,
+    )
+    with pytest.raises(ValueError) as exc_info:
+        _ = len(sampler)  # triggers internal build
+
+    assert "num_batches(2) < world_size(4)" in str(exc_info.value)
+    assert "drop_last=False" in str(exc_info.value)
