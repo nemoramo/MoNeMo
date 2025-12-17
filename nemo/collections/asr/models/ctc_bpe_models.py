@@ -28,7 +28,7 @@ from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.ctc_models import EncDecCTCModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCBPEDecoding, CTCBPEDecodingConfig
-from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
+from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler, resolve_asr_dataloader_batching
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils
@@ -138,20 +138,9 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             # support datasets that are lists of lists
             collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
-        sampler = None
-        batch_sampler = None
-        dataloader_batch_size = config['batch_size']
-        dataloader_drop_last = config.get('drop_last', False)
-        if config.get('use_semi_sorted_batching', False):
-            if not isinstance(dataset, _AudioTextDataset):
-                raise RuntimeError(
-                    "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
-                    f"but found dataset of type {type(dataset)}"
-                )
-            batch_sampler = get_semi_sorted_batch_sampler(self, dataset, config)
-            dataloader_batch_size = 1
-            dataloader_drop_last = False
-            shuffle = False
+        sampler, batch_sampler, dataloader_batch_size, dataloader_drop_last, shuffle = resolve_asr_dataloader_batching(
+            self, dataset, config, shuffle
+        )
 
         return torch.utils.data.DataLoader(
             dataset=dataset,

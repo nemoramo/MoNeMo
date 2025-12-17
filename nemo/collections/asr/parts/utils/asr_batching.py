@@ -345,6 +345,7 @@ def get_length_budget_batch_sampler(model: ASRModel, dataset, config: dict):
             shuffle=shuffle,
             seed=seed,
             max_batch_size=max_batch_size,
+            drop_last=drop_last,
         )
 
     return sampler

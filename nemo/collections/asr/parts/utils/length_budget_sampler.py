@@ -88,6 +88,7 @@ class LengthBudgetBatchSampler(Sampler[List[int]]):
         shuffle: bool = False,
         seed: int = 0,
         max_batch_size: Optional[int] = None,
+        drop_last: bool = False,
     ):
         super().__init__(None)
         self.lengths = [float(x) for x in lengths]
@@ -95,6 +96,7 @@ class LengthBudgetBatchSampler(Sampler[List[int]]):
         self.shuffle = shuffle
         self.seed = seed
         self.max_batch_size = max_batch_size
+        self.drop_last = drop_last
 
         self._epoch = 0
         self._batches: Optional[List[List[int]]] = None
@@ -120,11 +122,18 @@ class LengthBudgetBatchSampler(Sampler[List[int]]):
 
     def __iter__(self) -> Iterator[List[int]]:
         self._ensure_batches()
-        for batch in self._batches:
-            yield batch
+        if self.drop_last:
+            # Drop the last incomplete batch to maintain consistent iteration count
+            for batch in self._batches[:-1]:
+                yield batch
+        else:
+            for batch in self._batches:
+                yield batch
 
     def __len__(self) -> int:
         self._ensure_batches()
+        if self.drop_last:
+            return max(0, len(self._batches) - 1)
         return len(self._batches)
 
 
