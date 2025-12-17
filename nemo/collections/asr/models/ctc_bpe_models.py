@@ -139,6 +139,7 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
         sampler = None
+        batch_sampler = None
         dataloader_batch_size = config['batch_size']
         dataloader_drop_last = config.get('drop_last', False)
         if config.get('use_semi_sorted_batching', False):
@@ -147,9 +148,8 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
                     "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
                     f"but found dataset of type {type(dataset)}"
                 )
-            # set batch_size and batch_sampler to None to disable automatic batching
-            sampler = get_semi_sorted_batch_sampler(self, dataset, config)
-            dataloader_batch_size = None
+            batch_sampler = get_semi_sorted_batch_sampler(self, dataset, config)
+            dataloader_batch_size = 1
             dataloader_drop_last = False
             shuffle = False
 
@@ -157,10 +157,10 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             dataset=dataset,
             batch_size=dataloader_batch_size,
             sampler=sampler,
-            batch_sampler=None,
+            batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             drop_last=dataloader_drop_last,
-            shuffle=shuffle if sampler is None else False,
+            shuffle=shuffle if sampler is None and batch_sampler is None else False,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
         )

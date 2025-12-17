@@ -124,9 +124,9 @@ class TestASRSamplers:
                     )
                     dataloader_with_ssb = torch.utils.data.DataLoader(
                         dataset=dataset,
-                        batch_size=None,
-                        sampler=sampler,
-                        batch_sampler=None,
+                        batch_size=1,
+                        sampler=None,
+                        batch_sampler=sampler,
                         collate_fn=lambda x: audio_to_text._speech_collate_fn(x, pad_id=0),
                     )
                     dataloader = torch.utils.data.DataLoader(

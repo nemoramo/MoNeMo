@@ -11,7 +11,7 @@
 # limitations under the License.
 
 import pytest
-from torch.utils.data import ConcatDataset, IterableDataset
+from torch.utils.data import ConcatDataset, IterableDataset, Subset
 
 from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.parts.utils.asr_batching import get_length_budget_batch_sampler
@@ -146,6 +146,36 @@ def test_length_budget_sampler_supports_concat_dataset():
 
     flat_indices = [idx for batch in batches for idx in batch]
     assert set(flat_indices).issubset(set(range(len(concat))))
+
+
+@pytest.mark.unit
+def test_length_budget_sampler_supports_subset_dataset():
+    base = _DummyASRDataset([1.0, 2.0, 3.0, 4.0])
+    subset = Subset(base, [3, 1, 1])
+
+    sampler = get_length_budget_batch_sampler(_DummyModel(), subset, {"length_budget": 10.0, "shuffle": False})
+    batches = list(sampler)
+
+    flat_indices = [idx for batch in batches for idx in batch]
+    assert set(flat_indices).issubset(set(range(len(subset))))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("length_budget", [0, -1, "bad"])
+def test_length_budget_sampler_rejects_non_positive_length_budget(length_budget):
+    with pytest.raises(ValueError):
+        get_length_budget_batch_sampler(_DummyModel(), _DummyASRDataset([1.0, 2.0]), {"length_budget": length_budget})
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("max_batch_size", [0, -1, 1.5, True, "bad"])
+def test_length_budget_sampler_rejects_invalid_max_batch_size(max_batch_size):
+    with pytest.raises(ValueError):
+        get_length_budget_batch_sampler(
+            _DummyModel(),
+            _DummyASRDataset([1.0, 2.0]),
+            {"length_budget": 3.0, "max_batch_size": max_batch_size},
+        )
 
 
 @pytest.mark.unit
