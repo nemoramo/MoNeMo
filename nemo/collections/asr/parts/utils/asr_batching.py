@@ -17,10 +17,15 @@ from typing import Iterator, List, Optional, Union
 
 import numpy as np
 import torch
+from torch.utils.data import ConcatDataset, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 
 from nemo.collections.asr.data.audio_to_text import AudioToBPEDataset, AudioToCharDataset
 from nemo.collections.asr.models.asr_model import ASRModel
+from nemo.collections.asr.parts.utils.length_budget_sampler import (
+    DistributedLengthBudgetBatchSampler,
+    LengthBudgetBatchSampler,
+)
 from nemo.utils import logging
 
 
@@ -236,5 +241,85 @@ def get_semi_sorted_batch_sampler(
         randomization_factor=config.get('randomization_factor', None),
         seed=config.get('semi_sort_sampler_seed', 42),
     )
+
+    return sampler
+
+
+def _extract_durations_from_dataset(dataset) -> List[float]:
+    """
+    Extract a flat list of durations from supported datasets. Supports ConcatDataset of
+    compatible datasets.
+    """
+    if isinstance(dataset, ConcatDataset):
+        durations: List[float] = []
+        for ds in dataset.datasets:
+            durations.extend(_extract_durations_from_dataset(ds))
+        return durations
+
+    if hasattr(dataset, "manifest_processor") and hasattr(dataset.manifest_processor, "collection"):
+        durations = [float(sample.duration) for sample in dataset.manifest_processor.collection]
+    elif hasattr(dataset, "collection"):
+        durations = [float(sample.duration) for sample in dataset.collection]
+    elif hasattr(dataset, "durations"):
+        durations = [float(duration) for duration in dataset.durations]
+    else:
+        raise ValueError("Dataset does not expose durations via collection or durations attribute.")
+
+    if len(durations) != len(dataset):
+        raise ValueError(f"Duration list length {len(durations)} does not match dataset length {len(dataset)}.")
+
+    return durations
+
+
+def get_length_budget_batch_sampler(model: ASRModel, dataset, config: dict):
+    """
+    Build a length-budget batch sampler (single-rank or distributed) for map-style ASR datasets.
+
+    The sampler will greedily group samples by cost = batch_size * padded_len to fit inside
+    `length_budget`. For distributed training, steps are balanced so each rank runs the same
+    number of iterations.
+    """
+    if isinstance(dataset, IterableDataset):
+        raise ValueError("Length-budget batch sampler only supports map-style datasets.")
+
+    length_budget = config.get("length_budget")
+    if length_budget is None:
+        raise ValueError("length_budget must be set in the dataloader config to use the length-budget sampler.")
+
+    durations = _extract_durations_from_dataset(dataset)
+    shuffle = bool(config.get("shuffle", True))
+    drop_last = bool(config.get("drop_last", True))
+    max_batch_size = config.get("max_batch_size", None)
+    balance_across_ranks = bool(config.get("balance_across_ranks", True))
+    seed = int(config.get("length_budget_seed", config.get("seed", 0)))
+
+    logging.info(
+        f"Using length-budget sampler with budget={length_budget}, "
+        f"max_batch_size={max_batch_size}, drop_last={drop_last}, shuffle={shuffle}."
+    )
+
+    world_size = int(getattr(model, "world_size", 1) or 1)
+    rank = int(getattr(model, "global_rank", 0) or 0)
+
+    if world_size > 1:
+        sampler = DistributedLengthBudgetBatchSampler(
+            lengths=durations,
+            length_budget=float(length_budget),
+            world_size=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+            balance_across_ranks=balance_across_ranks,
+            max_batch_size=max_batch_size,
+        )
+    else:
+        sampler = LengthBudgetBatchSampler(
+            lengths=durations,
+            length_budget=float(length_budget),
+            shuffle=shuffle,
+            seed=seed,
+            max_batch_size=max_batch_size,
+        )
 
     return sampler

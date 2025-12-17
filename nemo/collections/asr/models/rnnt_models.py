@@ -39,7 +39,10 @@ from nemo.collections.asr.parts.mixins import (
 )
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTDecoding, RNNTDecodingConfig
-from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler
+from nemo.collections.asr.parts.utils.asr_batching import (
+    get_length_budget_batch_sampler,
+    get_semi_sorted_batch_sampler,
+)
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_outputs
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -517,27 +520,48 @@ class EncDecRNNTModel(ASRModel, ASRModuleMixin, ExportableEncDecModel, ASRTransc
             # support datasets that are lists of lists
             collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
+        sampler = None
         batch_sampler = None
+        dataloader_batch_size = config['batch_size']
+        dataloader_drop_last = config.get('drop_last', False)
+
+        use_length_budget = config.get('use_length_budget_sampler', False) or config.get('length_budget') is not None
+
+        if use_length_budget:
+            if not isinstance(dataset, _AudioTextDataset) or isinstance(dataset, torch.utils.data.IterableDataset):
+                raise RuntimeError(
+                    "Length-budget sampler supports only map-style AudioToCharDataset or AudioToBPEDataset."
+                )
+            batch_sampler = get_length_budget_batch_sampler(self, dataset, config)
+            dataloader_batch_size = None
+            dataloader_drop_last = False
+            config['batch_size'] = None
+            config['drop_last'] = False
+            shuffle = False
+
         if config.get('use_semi_sorted_batching', False):
+            if batch_sampler is not None:
+                raise RuntimeError("Length-budget sampler and semi-sorted batching cannot be enabled together.")
             if not isinstance(dataset, _AudioTextDataset):
                 raise RuntimeError(
                     "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
                     f"but found dataset of type {type(dataset)}"
                 )
-            # set batch_size and batch_sampler to None to disable automatic batching
-            batch_sampler = get_semi_sorted_batch_sampler(self, dataset, config)
+            sampler = get_semi_sorted_batch_sampler(self, dataset, config)
+            dataloader_batch_size = None
+            dataloader_drop_last = False
             config['batch_size'] = None
             config['drop_last'] = False
             shuffle = False
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
-            batch_size=config['batch_size'],
-            sampler=batch_sampler,
-            batch_sampler=None,
+            batch_size=dataloader_batch_size,
+            sampler=sampler,
+            batch_sampler=batch_sampler,
             collate_fn=collate_fn,
-            drop_last=config.get('drop_last', False),
-            shuffle=shuffle,
+            drop_last=dataloader_drop_last,
+            shuffle=shuffle if sampler is None and batch_sampler is None else False,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
         )
