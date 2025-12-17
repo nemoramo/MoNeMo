@@ -3,10 +3,11 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 
 @dataclass(frozen=True)

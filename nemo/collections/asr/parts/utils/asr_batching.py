@@ -357,7 +357,7 @@ def resolve_asr_dataloader_batching(model: ASRModel, dataset, config: dict, shuf
 
     This helper centralizes mutual-exclusion and defaults for:
     - length-budget batch sampling (via `batch_sampler`)
-    - semi-sorted batching (via `batch_sampler`)
+    - semi-sorted batching (via `sampler` that yields batch indices)
     """
     sampler = None
     batch_sampler = None
@@ -369,11 +369,6 @@ def resolve_asr_dataloader_batching(model: ASRModel, dataset, config: dict, shuf
     if use_length_budget:
         if isinstance(dataset, IterableDataset):
             raise RuntimeError("Length-budget sampler supports only map-style datasets (IterableDataset found).")
-        if dataloader_batch_size != 1:
-            logging.warning(
-                "Length-budget batching is enabled; DataLoader `batch_size` will be ignored. "
-                "Use `length_budget` and `max_batch_size` to control batching."
-            )
         batch_sampler = get_length_budget_batch_sampler(model, dataset, config)
         dataloader_batch_size = 1
         dataloader_drop_last = False
@@ -387,8 +382,8 @@ def resolve_asr_dataloader_batching(model: ASRModel, dataset, config: dict, shuf
                 "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
                 f"but found dataset of type {type(dataset)}"
             )
-        batch_sampler = get_semi_sorted_batch_sampler(model, dataset, config)
-        dataloader_batch_size = 1
+        sampler = get_semi_sorted_batch_sampler(model, dataset, config)
+        dataloader_batch_size = None
         dataloader_drop_last = False
         shuffle = False
 
