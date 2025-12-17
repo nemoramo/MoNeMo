@@ -654,7 +654,6 @@ if not PRETOKENIZE:
         ]
         if test_manifest_path:
             args += ["++model.test_ds.pretokenize=false"]
-
 # batch 大小
 if train_bs_override is not None:
     args += [f"model.train_ds.batch_size={train_bs_override}"]
