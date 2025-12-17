@@ -29,7 +29,7 @@ from nemo.collections.asr.metrics.wer import WER
 from nemo.collections.asr.models.rnnt_models import EncDecRNNTModel
 from nemo.collections.asr.parts.mixins import ASRBPEMixin
 from nemo.collections.asr.parts.submodules.rnnt_decoding import RNNTBPEDecoding, RNNTBPEDecodingConfig
-from nemo.collections.asr.parts.utils.asr_batching import get_semi_sorted_batch_sampler, resolve_asr_dataloader_batching
+from nemo.collections.asr.parts.utils.asr_batching import resolve_asr_dataloader_batching
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.core.classes.common import PretrainedModelInfo
 from nemo.utils import logging, model_utils

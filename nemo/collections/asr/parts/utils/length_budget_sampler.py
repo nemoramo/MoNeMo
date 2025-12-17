@@ -123,7 +123,7 @@ class LengthBudgetBatchSampler(Sampler[List[int]]):
     def __iter__(self) -> Iterator[List[int]]:
         self._ensure_batches()
         if self.drop_last:
-            # Drop the last incomplete batch to maintain consistent iteration count
+            # Drop the final batch (best-effort; mirrors DataLoader drop_last intent under dynamic batching).
             for batch in self._batches[:-1]:
                 yield batch
         else:
