@@ -20,7 +20,7 @@ import torch
 from torch.utils.data import ConcatDataset, IterableDataset
 from torch.utils.data.distributed import DistributedSampler
 
-from nemo.collections.asr.data.audio_to_text import AudioToBPEDataset, AudioToCharDataset
+from nemo.collections.asr.data.audio_to_text import AudioToBPEDataset, AudioToCharDataset, _AudioTextDataset
 from nemo.collections.asr.models.asr_model import ASRModel
 from nemo.collections.asr.parts.utils.length_budget_sampler import (
     DistributedLengthBudgetBatchSampler,
@@ -287,8 +287,8 @@ def get_length_budget_batch_sampler(model: ASRModel, dataset, config: dict):
         raise ValueError("length_budget must be set in the dataloader config to use the length-budget sampler.")
 
     durations = _extract_durations_from_dataset(dataset)
-    shuffle = bool(config.get("shuffle", True))
-    drop_last = bool(config.get("drop_last", True))
+    shuffle = bool(config.get("shuffle", False))
+    drop_last = bool(config.get("drop_last", False))
     max_batch_size = config.get("max_batch_size", None)
     balance_across_ranks = bool(config.get("balance_across_ranks", True))
     seed = int(config.get("length_budget_seed", config.get("seed", 0)))
@@ -323,3 +323,42 @@ def get_length_budget_batch_sampler(model: ASRModel, dataset, config: dict):
         )
 
     return sampler
+
+
+def resolve_asr_dataloader_batching(model: ASRModel, dataset, config: dict, shuffle: bool):
+    """
+    Resolve DataLoader batching args based on config flags.
+
+    This helper centralizes mutual-exclusion and defaults for:
+    - length-budget batch sampling (via `batch_sampler`)
+    - semi-sorted batching (via `sampler` that yields batch indices)
+    """
+    sampler = None
+    batch_sampler = None
+    dataloader_batch_size = config['batch_size']
+    dataloader_drop_last = config.get('drop_last', False)
+
+    use_length_budget = config.get('use_length_budget_sampler', False) or config.get('length_budget') is not None
+
+    if use_length_budget:
+        if isinstance(dataset, IterableDataset):
+            raise RuntimeError("Length-budget sampler supports only map-style datasets (IterableDataset found).")
+        batch_sampler = get_length_budget_batch_sampler(model, dataset, config)
+        dataloader_batch_size = 1
+        dataloader_drop_last = False
+        shuffle = False
+
+    if config.get('use_semi_sorted_batching', False):
+        if batch_sampler is not None:
+            raise RuntimeError("Length-budget sampler and semi-sorted batching cannot be enabled together.")
+        if not isinstance(dataset, _AudioTextDataset):
+            raise RuntimeError(
+                "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
+                f"but found dataset of type {type(dataset)}"
+            )
+        sampler = get_semi_sorted_batch_sampler(model, dataset, config)
+        dataloader_batch_size = None
+        dataloader_drop_last = False
+        shuffle = False
+
+    return sampler, batch_sampler, dataloader_batch_size, dataloader_drop_last, shuffle

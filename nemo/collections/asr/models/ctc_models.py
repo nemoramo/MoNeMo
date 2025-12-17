@@ -23,7 +23,6 @@ from omegaconf import DictConfig, OmegaConf, open_dict
 from torch.utils.data import DataLoader
 
 from nemo.collections.asr.data import audio_to_text_dataset
-from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToCharDALIDataset, DALIOutputs
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.ctc import CTCLoss
@@ -34,7 +33,7 @@ from nemo.collections.asr.parts.mixins import ASRModuleMixin, ASRTranscriptionMi
 from nemo.collections.asr.parts.mixins.transcription import GenericTranscriptionType, TranscriptionReturnType
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.ctc_decoding import CTCDecoding, CTCDecodingConfig
-from nemo.collections.asr.parts.utils.asr_batching import get_length_budget_batch_sampler, get_semi_sorted_batch_sampler
+from nemo.collections.asr.parts.utils.asr_batching import resolve_asr_dataloader_batching
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.asr.parts.utils.timestamp_utils import process_timestamp_outputs
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
@@ -376,39 +375,13 @@ class EncDecCTCModel(ASRModel, ExportableEncDecModel, ASRModuleMixin, InterCTCMi
             # support datasets that are lists of lists
             collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
-        sampler = None
-        batch_sampler = None
-        dataloader_batch_size = config['batch_size']
-        dataloader_drop_last = config.get('drop_last', False)
-
-        use_length_budget = config.get('use_length_budget_sampler', False) or config.get('length_budget') is not None
-
-        if use_length_budget:
-            if not isinstance(dataset, _AudioTextDataset) or isinstance(dataset, torch.utils.data.IterableDataset):
-                raise RuntimeError(
-                    "Length-budget sampler supports only map-style AudioToCharDataset or AudioToBPEDataset."
-                )
-            batch_sampler = get_length_budget_batch_sampler(self, dataset, config)
-            dataloader_batch_size = None
-            dataloader_drop_last = False
-            config['batch_size'] = None
-            config['drop_last'] = False
-            shuffle = False
-
-        if config.get('use_semi_sorted_batching', False):
-            if batch_sampler is not None:
-                raise RuntimeError("Length-budget sampler and semi-sorted batching cannot be enabled together.")
-            if not isinstance(dataset, _AudioTextDataset):
-                raise RuntimeError(
-                    "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
-                    f"but found dataset of type {type(dataset)}"
-                )
-            sampler = get_semi_sorted_batch_sampler(self, dataset, config)
-            dataloader_batch_size = None
-            dataloader_drop_last = False
-            config['batch_size'] = None
-            config['drop_last'] = False
-            shuffle = False
+        (
+            sampler,
+            batch_sampler,
+            dataloader_batch_size,
+            dataloader_drop_last,
+            shuffle,
+        ) = resolve_asr_dataloader_batching(self, dataset, config, shuffle)
 
         return torch.utils.data.DataLoader(
             dataset=dataset,

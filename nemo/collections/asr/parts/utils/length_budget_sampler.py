@@ -85,7 +85,7 @@ class LengthBudgetBatchSampler(Sampler[List[int]]):
         self,
         lengths: Sequence[float],
         length_budget: float,
-        shuffle: bool = True,
+        shuffle: bool = False,
         seed: int = 0,
         max_batch_size: Optional[int] = None,
     ):
@@ -137,9 +137,9 @@ class DistributedLengthBudgetBatchSampler(Sampler[List[int]]):
         length_budget: float,
         world_size: int,
         rank: int,
-        shuffle: bool = True,
+        shuffle: bool = False,
         seed: int = 0,
-        drop_last: bool = True,
+        drop_last: bool = False,
         balance_across_ranks: bool = True,
         max_batch_size: Optional[int] = None,
     ):

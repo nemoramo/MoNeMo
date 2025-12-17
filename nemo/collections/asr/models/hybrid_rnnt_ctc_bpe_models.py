@@ -181,7 +181,9 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
             # support datasets that are lists of lists
             collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
-        batch_sampler = None
+        sampler = None
+        dataloader_batch_size = config['batch_size']
+        dataloader_drop_last = config.get('drop_last', False)
         if config.get('use_semi_sorted_batching', False):
             if not isinstance(dataset, _AudioTextDataset):
                 raise RuntimeError(
@@ -189,19 +191,19 @@ class EncDecHybridRNNTCTCBPEModel(EncDecHybridRNNTCTCModel, ASRBPEMixin):
                     f"but found dataset of type {type(dataset)}"
                 )
             # set batch_size and batch_sampler to None to disable automatic batching
-            batch_sampler = get_semi_sorted_batch_sampler(self, dataset, config)
-            config['batch_size'] = None
-            config['drop_last'] = False
+            sampler = get_semi_sorted_batch_sampler(self, dataset, config)
+            dataloader_batch_size = None
+            dataloader_drop_last = False
             shuffle = False
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
-            batch_size=config['batch_size'],
-            sampler=batch_sampler,
+            batch_size=dataloader_batch_size,
+            sampler=sampler,
             batch_sampler=None,
             collate_fn=collate_fn,
-            drop_last=config.get('drop_last', False),
-            shuffle=shuffle,
+            drop_last=dataloader_drop_last,
+            shuffle=shuffle if sampler is None else False,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
         )
