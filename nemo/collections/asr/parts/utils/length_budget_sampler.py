@@ -98,6 +98,9 @@ class LengthBudgetBatchSampler(Sampler[List[int]]):
 
         self._epoch = 0
         self._batches: Optional[List[List[int]]] = None
+        # Lightning/Fabric expects to call `set_epoch()` on `dataloader.batch_sampler.sampler`.
+        # When this object is passed as `batch_sampler`, expose `.sampler` to itself.
+        self.sampler = self
 
     def set_epoch(self, epoch: int) -> None:
         """Update epoch to change shuffle order."""
@@ -162,6 +165,9 @@ class DistributedLengthBudgetBatchSampler(Sampler[List[int]]):
         self._epoch = 0
         self._rank_batches: Optional[List[List[int]]] = None
         self._steps: Optional[int] = None
+        # Lightning/Fabric expects to call `set_epoch()` on `dataloader.batch_sampler.sampler`.
+        # When this object is passed as `batch_sampler`, expose `.sampler` to itself.
+        self.sampler = self
 
     def set_epoch(self, epoch: int) -> None:
         """Update epoch to change shuffle order."""
@@ -202,12 +208,19 @@ class DistributedLengthBudgetBatchSampler(Sampler[List[int]]):
             steps = math.ceil(num_batches / self.world_size)
             total_needed = steps * self.world_size
             if total_needed > num_batches:
-                for idx in range(total_needed - num_batches):
-                    batch_indices.append(batch_indices[idx % num_batches])
+                pad = total_needed - num_batches
+                if self.balance_across_ranks:
+                    # Prefer duplicating the cheapest batches when padding.
+                    for idx in range(pad):
+                        batch_indices.append(batch_indices[-1 - (idx % num_batches)])
+                else:
+                    for idx in range(pad):
+                        batch_indices.append(batch_indices[idx % num_batches])
 
         rank_batches: List[List[int]] = []
         for step in range(steps):
-            batch_idx = batch_indices[step * self.world_size + self.rank]
+            within_step_rank = (self.rank + step) % self.world_size if self.balance_across_ranks else self.rank
+            batch_idx = batch_indices[step * self.world_size + within_step_rank]
             rank_batches.append(batches[batch_idx])
 
         self._rank_batches = rank_batches

@@ -179,6 +179,69 @@ def test_length_budget_sampler_rejects_invalid_max_batch_size(max_batch_size):
 
 
 @pytest.mark.unit
+def test_length_budget_batch_sampler_exposes_sampler_attr_single_rank():
+    lengths = [10.0, 9.0, 8.0, 7.0, 6.0]
+    sampler = LengthBudgetBatchSampler(lengths, length_budget=0.5, shuffle=True, seed=123)
+    assert hasattr(sampler, "sampler")
+    assert sampler.sampler is sampler
+
+    import random
+
+    sampler.sampler.set_epoch(0)
+    order0 = [batch[0] for batch in sampler]
+    expected0 = list(range(len(lengths)))
+    random.Random(123).shuffle(expected0)
+    assert order0 == expected0
+
+    sampler.sampler.set_epoch(1)
+    order1 = [batch[0] for batch in sampler]
+    expected1 = list(range(len(lengths)))
+    random.Random(124).shuffle(expected1)
+    assert order1 == expected1
+
+
+@pytest.mark.unit
+def test_distributed_length_budget_batch_sampler_exposes_sampler_attr():
+    lengths = [1.0, 2.0, 3.0]
+    sampler = DistributedLengthBudgetBatchSampler(lengths, length_budget=2.0, world_size=2, rank=0, shuffle=True, seed=1)
+    assert hasattr(sampler, "sampler")
+    assert sampler.sampler is sampler
+    sampler.sampler.set_epoch(2)
+
+
+@pytest.mark.unit
+def test_distributed_length_budget_sampler_rotates_rank_assignment_when_balancing():
+    lengths = [5.0, 4.0, 3.0, 2.0]
+    budget = 0.5
+
+    sampler_rank0 = DistributedLengthBudgetBatchSampler(
+        lengths, length_budget=budget, world_size=2, rank=0, shuffle=False, drop_last=False, balance_across_ranks=True
+    )
+    sampler_rank1 = DistributedLengthBudgetBatchSampler(
+        lengths, length_budget=budget, world_size=2, rank=1, shuffle=False, drop_last=False, balance_across_ranks=True
+    )
+
+    assert [batch[0] for batch in sampler_rank0] == [0, 3]
+    assert [batch[0] for batch in sampler_rank1] == [1, 2]
+
+
+@pytest.mark.unit
+def test_distributed_length_budget_sampler_pads_with_cheapest_batches_when_balancing():
+    lengths = [5.0, 4.0, 1.0]
+    budget = 0.5
+
+    sampler_rank0 = DistributedLengthBudgetBatchSampler(
+        lengths, length_budget=budget, world_size=2, rank=0, shuffle=False, drop_last=False, balance_across_ranks=True
+    )
+    sampler_rank1 = DistributedLengthBudgetBatchSampler(
+        lengths, length_budget=budget, world_size=2, rank=1, shuffle=False, drop_last=False, balance_across_ranks=True
+    )
+
+    assert [batch[0] for batch in sampler_rank0] == [0, 2]
+    assert [batch[0] for batch in sampler_rank1] == [1, 2]
+
+
+@pytest.mark.unit
 def test_length_budget_sampler_rejects_iterable_dataset():
     class _DummyIterable(IterableDataset):
         def __iter__(self):

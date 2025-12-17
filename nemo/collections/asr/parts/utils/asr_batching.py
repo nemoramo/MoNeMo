@@ -99,6 +99,9 @@ class SemiSortBatchSampler(DistributedSampler):
         self.randomization_factor: float = randomization_factor
 
         self.local_num_batches: int = self._calculate_local_num_batches()
+        # Lightning/Fabric expects to call `set_epoch()` on `dataloader.batch_sampler.sampler`.
+        # When this object is passed as `batch_sampler`, expose `.sampler` to itself.
+        self.sampler = self
 
         logging.info(f"Semi Sorted Batch Sampler will be used")
 
