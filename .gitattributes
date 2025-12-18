@@ -1,0 +1,27 @@
+# Default all text files to LF to avoid CRLF issues in WSL/Linux tooling.
+* text=auto eol=lf
+
+# Keep Windows-native scripts as CRLF for compatibility.
+*.bat text eol=crlf
+*.cmd text eol=crlf
+*.ps1 text eol=crlf
+
+# Treat common binary formats as binary to prevent any line-ending conversions.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.zip binary
+*.tar binary
+*.gz binary
+*.tgz binary
+*.whl binary
+*.so binary
+*.dll binary
+*.exe binary
+*.pt binary
+*.pth binary
+*.ckpt binary
+*.nemo binary
