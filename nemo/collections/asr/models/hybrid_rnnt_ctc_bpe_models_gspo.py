@@ -735,6 +735,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             advantages = _group_normalize(rewards, eps=float(self.gspo_cfg.get("advantage_eps", 1e-8)))
         else:
             advantages = rewards - rewards.mean()
+        advantages_detached = advantages.detach()
 
         # 4) Compute logp_old (no_grad baseline) and logp_new (with grad) one-by-one to reduce peak memory.
         logp_old_list: List[torch.Tensor] = []
@@ -759,9 +760,14 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         logp_old = torch.stack(logp_old_list, dim=0)
         logp_new = torch.stack(logp_new_list, dim=0)
+        logp_old_detached = logp_old.detach()
+        logp_new_detached = logp_new.detach()
 
         rl_loss = gspo_clipped_loss_seq(
-            logp_new=logp_new, logp_old=logp_old, advantages=advantages.detach(), clip_eps=float(self.gspo_cfg.clip_eps)
+            logp_new=logp_new,
+            logp_old=logp_old,
+            advantages=advantages_detached,
+            clip_eps=float(self.gspo_cfg.clip_eps),
         )
 
         # 5) Optional supervised anchor (ground truth NLL).
@@ -782,24 +788,27 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         metrics["gspo_reward_mean"] = rewards.mean().detach()
         metrics["gspo_reward_std"] = rewards.std(unbiased=False).detach()
 
+        # NOTE: In the current "on-policy single-step" mode, `train_loss` / `gspo_rl_loss` can be close to 0 because
+        # advantages are mean-zero (and often normalized). This does NOT imply gradients are zero.
+        # These statistics are the primary "is it updating / is it buggy?" canary set.
+        metrics["gspo_adv_mean"] = advantages_detached.mean()
+        metrics["gspo_adv_std"] = advantages_detached.std(unbiased=False)
+
+        metrics["gspo_logp_old_mean"] = logp_old_detached.mean()
+        metrics["gspo_logp_old_std"] = logp_old_detached.std(unbiased=False)
+        metrics["gspo_logp_new_mean"] = logp_new_detached.mean()
+        metrics["gspo_logp_new_std"] = logp_new_detached.std(unbiased=False)
+
+        log_ratio = (logp_new_detached - logp_old_detached).clamp(min=-20.0, max=20.0)
+        ratio = torch.exp(log_ratio)
+        clip_eps = float(self.gspo_cfg.clip_eps)
+        metrics["gspo_ratio_mean"] = ratio.mean()
+        metrics["gspo_ratio_std"] = ratio.std(unbiased=False)
+        metrics["gspo_clip_frac"] = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
+        metrics["gspo_approx_kl"] = (logp_old_detached - logp_new_detached).mean()
+
         if compute_diagnostics:
             metrics.update(self._maybe_validate_fused_logp(encoded=encoded, encoded_len=encoded_len, token_ids=ref_token_ids))
-
-            adv_detached = advantages.detach()
-            metrics["gspo_adv_mean"] = adv_detached.mean()
-            metrics["gspo_adv_std"] = adv_detached.std(unbiased=False)
-            metrics["gspo_adv_min"] = adv_detached.min()
-            metrics["gspo_adv_max"] = adv_detached.max()
-
-            # PPO-style canaries for silent bugs (even if you expect them ~0 in on-policy single-step mode).
-            # NOTE: Clamp log-ratio before exp to avoid inf in diagnostics.
-            log_ratio = (logp_new.detach() - logp_old.detach()).clamp(min=-20.0, max=20.0)
-            ratio = torch.exp(log_ratio)
-            clip_eps = float(self.gspo_cfg.clip_eps)
-            metrics["gspo_ratio_mean"] = ratio.mean()
-            metrics["gspo_ratio_std"] = ratio.std(unbiased=False)
-            metrics["gspo_clip_frac"] = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
-            metrics["gspo_approx_kl"] = (logp_old.detach() - logp_new.detach()).mean()
 
             # N-best group diagnostics.
             k = max(1, len(hyp_texts))
@@ -816,8 +825,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             metrics["gspo_hyp_len_max"] = hyp_lens.max()
 
             metrics["gspo_corr_reward_hyp_len"] = _safe_corrcoef(rewards, hyp_lens)
-            metrics["gspo_corr_adv_hyp_len"] = _safe_corrcoef(adv_detached, hyp_lens)
-            metrics["gspo_corr_reward_logp_old"] = _safe_corrcoef(rewards, logp_old.detach())
+            metrics["gspo_corr_adv_hyp_len"] = _safe_corrcoef(advantages_detached, hyp_lens)
+            metrics["gspo_corr_reward_logp_old"] = _safe_corrcoef(rewards, logp_old_detached)
 
             if compute_timings:
                 for name, value in timings.items():
@@ -877,8 +886,31 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         # Logging.
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
+
+        # Always log core "is it updating / is it buggy?" metrics so users don't over-interpret `train_loss≈0`.
+        always_log_keys = {
+            "gspo_rl_loss",
+            "gspo_reward_mean",
+            "gspo_reward_std",
+            "gspo_adv_mean",
+            "gspo_adv_std",
+            "gspo_logp_old_mean",
+            "gspo_logp_old_std",
+            "gspo_logp_new_mean",
+            "gspo_logp_new_std",
+            "gspo_ratio_mean",
+            "gspo_ratio_std",
+            "gspo_clip_frac",
+            "gspo_approx_kl",
+        }
+        for key in sorted(always_log_keys):
+            if key in metrics_acc:
+                self.log(f"train_{key}", torch.stack(metrics_acc[key]).mean(), prog_bar=False, sync_dist=True)
+
         if do_log:
             for key, values in metrics_acc.items():
+                if key in always_log_keys:
+                    continue
                 # Metrics are per-sample; aggregate across batch to one scalar.
                 self.log(f"train_{key}", torch.stack(values).mean(), prog_bar=False, sync_dist=True)
 
