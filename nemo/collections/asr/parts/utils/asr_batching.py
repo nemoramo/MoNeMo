@@ -17,10 +17,15 @@ from typing import Iterator, List, Optional, Union
 
 import numpy as np
 import torch
+from torch.utils.data import ConcatDataset, IterableDataset, Subset
 from torch.utils.data.distributed import DistributedSampler
 
-from nemo.collections.asr.data.audio_to_text import AudioToBPEDataset, AudioToCharDataset
+from nemo.collections.asr.data.audio_to_text import AudioToBPEDataset, AudioToCharDataset, _AudioTextDataset
 from nemo.collections.asr.models.asr_model import ASRModel
+from nemo.collections.asr.parts.utils.length_budget_sampler import (
+    DistributedLengthBudgetBatchSampler,
+    LengthBudgetBatchSampler,
+)
 from nemo.utils import logging
 
 
@@ -50,10 +55,8 @@ class SemiSortBatchSampler(DistributedSampler):
 
         The torch calls the set_epoch method from the distributed data loader sampler
         at the end of each epoch to shuffle the samples according to the seed and
-        epoch number. So the SSB is passed to the dataloader as a sampler with the
-        dataloader's batch size options and the batch_sampler option set to None to
-        disable automatical batching. In this case, the sampler has become an iterator
-        that returns a list of batch indices.
+        epoch number. The SSB yields a list of sample indices for each batch, and
+        should therefore be passed to the DataLoader via `batch_sampler`.
 
         Args:
             global_rank: Rank among all GPUs.
@@ -96,6 +99,9 @@ class SemiSortBatchSampler(DistributedSampler):
         self.randomization_factor: float = randomization_factor
 
         self.local_num_batches: int = self._calculate_local_num_batches()
+        # Lightning/Fabric expects to call `set_epoch()` on `dataloader.batch_sampler.sampler`.
+        # When this object is passed as `batch_sampler`, expose `.sampler` to itself.
+        self.sampler = self
 
         logging.info(f"Semi Sorted Batch Sampler will be used")
 
@@ -238,3 +244,152 @@ def get_semi_sorted_batch_sampler(
     )
 
     return sampler
+
+
+def _extract_durations_from_dataset(dataset) -> List[float]:
+    """
+    Extract a flat list of durations from supported datasets. Supports ConcatDataset of
+    compatible datasets.
+    """
+    if isinstance(dataset, ConcatDataset):
+        durations: List[float] = []
+        for ds in dataset.datasets:
+            durations.extend(_extract_durations_from_dataset(ds))
+        return durations
+
+    if isinstance(dataset, Subset):
+        base_durations = _extract_durations_from_dataset(dataset.dataset)
+        indices = dataset.indices
+        if isinstance(indices, slice):
+            indices = range(len(base_durations))[indices]
+        try:
+            durations = [base_durations[int(i)] for i in indices]
+        except Exception as exc:
+            raise ValueError("Failed to index durations for a torch.utils.data.Subset.") from exc
+        if len(durations) != len(dataset):
+            raise ValueError(
+                f"Duration list length {len(durations)} does not match subset length {len(dataset)}."
+            )
+        return durations
+
+    if hasattr(dataset, "manifest_processor") and hasattr(dataset.manifest_processor, "collection"):
+        durations = [float(sample.duration) for sample in dataset.manifest_processor.collection]
+    elif hasattr(dataset, "collection"):
+        durations = [float(sample.duration) for sample in dataset.collection]
+    elif hasattr(dataset, "durations"):
+        durations = [float(duration) for duration in dataset.durations]
+    else:
+        raise ValueError("Dataset does not expose durations via collection or durations attribute.")
+
+    if len(durations) != len(dataset):
+        raise ValueError(f"Duration list length {len(durations)} does not match dataset length {len(dataset)}.")
+
+    return durations
+
+
+def get_length_budget_batch_sampler(model: ASRModel, dataset, config: dict):
+    """
+    Build a length-budget batch sampler (single-rank or distributed) for map-style ASR datasets.
+
+    The sampler will greedily group samples by cost = batch_size * padded_len to fit inside
+    `length_budget`. For distributed training, steps are balanced so each rank runs the same
+    number of iterations.
+    """
+    if isinstance(dataset, IterableDataset):
+        raise ValueError("Length-budget batch sampler only supports map-style datasets.")
+
+    length_budget = config.get("length_budget")
+    if length_budget is None:
+        raise ValueError("length_budget must be set in the dataloader config to use the length-budget sampler.")
+    try:
+        length_budget = float(length_budget)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"length_budget must be a positive number but found {length_budget}.") from exc
+    if length_budget <= 0:
+        raise ValueError(f"length_budget must be > 0 but found {length_budget}.")
+
+    durations = _extract_durations_from_dataset(dataset)
+    shuffle = bool(config.get("shuffle", False))
+    drop_last = bool(config.get("drop_last", False))
+    max_batch_size = config.get("max_batch_size", None)
+    if max_batch_size is not None:
+        if not isinstance(max_batch_size, int) or isinstance(max_batch_size, bool) or max_batch_size <= 0:
+            raise ValueError(f"max_batch_size must be a positive int but found {max_batch_size}.")
+    balance_across_ranks = bool(config.get("balance_across_ranks", True))
+    seed = int(config.get("length_budget_seed", config.get("seed", 0)))
+
+    logging.info(
+        f"Using length-budget sampler with budget={length_budget}, "
+        f"max_batch_size={max_batch_size}, drop_last={drop_last}, shuffle={shuffle}."
+    )
+
+    world_size = int(getattr(model, "world_size", 1) or 1)
+    rank = int(getattr(model, "global_rank", 0) or 0)
+
+    if world_size > 1:
+        sampler = DistributedLengthBudgetBatchSampler(
+            lengths=durations,
+            length_budget=length_budget,
+            world_size=world_size,
+            rank=rank,
+            shuffle=shuffle,
+            seed=seed,
+            drop_last=drop_last,
+            balance_across_ranks=balance_across_ranks,
+            max_batch_size=max_batch_size,
+        )
+    else:
+        sampler = LengthBudgetBatchSampler(
+            lengths=durations,
+            length_budget=length_budget,
+            shuffle=shuffle,
+            seed=seed,
+            max_batch_size=max_batch_size,
+            drop_last=drop_last,
+        )
+
+    return sampler
+
+
+def resolve_asr_dataloader_batching(model: ASRModel, dataset, config: dict, shuffle: bool):
+    """
+    Resolve DataLoader batching args based on config flags.
+
+    This helper centralizes mutual-exclusion and defaults for:
+    - length-budget batch sampling (via `batch_sampler`)
+    - semi-sorted batching (via `batch_sampler`)
+    """
+    sampler = None
+    batch_sampler = None
+    dataloader_batch_size = config['batch_size']
+    dataloader_drop_last = config.get('drop_last', False)
+
+    use_length_budget = config.get('use_length_budget_sampler', False) or config.get('length_budget') is not None
+
+    if use_length_budget:
+        if isinstance(dataset, IterableDataset):
+            raise RuntimeError("Length-budget sampler supports only map-style datasets (IterableDataset found).")
+        if dataloader_batch_size != 1:
+            logging.warning(
+                "Length-budget batching is enabled; DataLoader `batch_size` will be ignored. "
+                "Use `length_budget` and `max_batch_size` to control batching."
+            )
+        batch_sampler = get_length_budget_batch_sampler(model, dataset, config)
+        dataloader_batch_size = 1
+        dataloader_drop_last = False
+        shuffle = False
+
+    if config.get('use_semi_sorted_batching', False):
+        if batch_sampler is not None:
+            raise RuntimeError("Length-budget sampler and semi-sorted batching cannot be enabled together.")
+        if not isinstance(dataset, _AudioTextDataset):
+            raise RuntimeError(
+                "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
+                f"but found dataset of type {type(dataset)}"
+            )
+        batch_sampler = get_semi_sorted_batch_sampler(model, dataset, config)
+        dataloader_batch_size = 1
+        dataloader_drop_last = False
+        shuffle = False
+
+    return sampler, batch_sampler, dataloader_batch_size, dataloader_drop_last, shuffle
