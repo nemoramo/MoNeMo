@@ -355,17 +355,24 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         if self.joint.fuse_loss_wer:
             # Use fused Joint+Loss path to avoid materializing `joint` outside this scope.
             # NOTE: We temporarily set the loss reduction to None so that the fused joint returns per-sample NLL.
-            loss_reduction = self.loss.reduction
-            self.loss.reduction = None
-            nll, _, _, _ = self.joint(
-                encoder_outputs=encoded,
-                decoder_outputs=dec,
-                encoder_lengths=encoded_len,
-                transcripts=targets,
-                transcript_lengths=target_lens,
-                compute_wer=False,
-            )
-            self.loss.reduction = loss_reduction
+            # This mutates shared module state, so it must be restored even if an exception is raised.
+            joint_loss = getattr(self.joint, "loss", None)
+            if joint_loss is None:
+                raise RuntimeError("`joint.fuse_loss_wer=True` but `joint.loss` is None; cannot compute per-sample logp.")
+
+            loss_reduction = joint_loss.reduction
+            try:
+                joint_loss.reduction = None
+                nll, _, _, _ = self.joint(
+                    encoder_outputs=encoded,
+                    decoder_outputs=dec,
+                    encoder_lengths=encoded_len,
+                    transcripts=targets,
+                    transcript_lengths=target_lens,
+                    compute_wer=False,
+                )
+            finally:
+                joint_loss.reduction = loss_reduction
         else:
             # Align target length semantics with NeMo's standard RNNT/TDT training path:
             # - Decoder returns `dec_lens` (typically equal to the passed-in `target_lens`)
@@ -447,8 +454,19 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             raise RuntimeError("Decoding returned an empty hypothesis list; check decoding config and inputs.")
 
         # 3) Compute rewards and advantages on CPU-ish (tiny tensors).
-        hyp_texts: List[str] = [h.text for h in hyps]
-        rewards = torch.tensor([self._reward_from_text(t, ref_text) for t in hyp_texts], device=device, dtype=torch.float32)
+        hyp_token_ids_list: List[List[int]] = [self._hypothesis_to_token_ids(hyp) for hyp in hyps]
+        hyp_texts: List[str] = []
+        for hyp, token_ids in zip(hyps, hyp_token_ids_list):
+            # NOTE: `Hypothesis.text` is not guaranteed to be populated for all decoding paths/configs.
+            # Fall back to deterministic token-id decoding to avoid silently computing rewards on empty strings.
+            hyp_text = getattr(hyp, "text", None)
+            if not hyp_text:
+                hyp_text = self._tokens_to_text(token_ids)
+            hyp_texts.append(str(hyp_text).strip())
+
+        rewards = torch.tensor(
+            [self._reward_from_text(t, ref_text) for t in hyp_texts], device=device, dtype=torch.float32
+        )
         if self.gspo_cfg.get("normalize_advantage", True):
             advantages = _group_normalize(rewards, eps=float(self.gspo_cfg.get("advantage_eps", 1e-8)))
         else:
@@ -459,12 +477,10 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         logp_new_list: List[torch.Tensor] = []
 
         with torch.no_grad():
-            for hyp in hyps:
-                token_ids = self._hypothesis_to_token_ids(hyp)
+            for token_ids in hyp_token_ids_list:
                 logp_old_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids).detach())
 
-        for hyp in hyps:
-            token_ids = self._hypothesis_to_token_ids(hyp)
+        for token_ids in hyp_token_ids_list:
             logp_new_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids))
 
         logp_old = torch.stack(logp_old_list, dim=0)
