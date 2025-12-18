@@ -50,3 +50,11 @@ repos:
         # pre-commit's default_language_version, see
         # https://pre-commit.com/#top_level-default_language_version
         language_version: python3.10
+
+  - repo: local
+    hooks:
+      - id: check-unicode-controls
+        name: Detect Unicode control characters
+        entry: python tools/security/check_unicode_controls.py
+        language: python
+        types: [text]

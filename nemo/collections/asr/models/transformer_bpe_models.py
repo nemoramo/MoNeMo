@@ -40,6 +40,7 @@ from nemo.collections.asr.modules.transformer import (
 from nemo.collections.asr.parts.mixins import ASRBPEMixin, ASRTranscriptionMixin, TranscribeConfig
 from nemo.collections.asr.parts.preprocessing.segment import ChannelSelectorType
 from nemo.collections.asr.parts.submodules.token_classifier import TokenClassifier
+from nemo.collections.asr.parts.utils.asr_batching import resolve_asr_dataloader_batching
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.common.losses import SmoothedCrossEntropyLoss
@@ -258,12 +259,18 @@ class EncDecTransfModelBPE(ASRModel, ExportableEncDecModel, ASRBPEMixin, ASRTran
         else:
             collate_fn = dataset.datasets[0].collate_fn
 
+        sampler, batch_sampler, dataloader_batch_size, dataloader_drop_last, shuffle = resolve_asr_dataloader_batching(
+            self, dataset, config, shuffle
+        )
+
         return torch.utils.data.DataLoader(
             dataset=dataset,
-            batch_size=config['batch_size'],
+            batch_size=dataloader_batch_size,
+            sampler=sampler,
+            batch_sampler=batch_sampler,
             collate_fn=collate_fn,
-            drop_last=config.get('drop_last', False),
-            shuffle=shuffle,
+            drop_last=dataloader_drop_last,
+            shuffle=shuffle if sampler is None and batch_sampler is None else False,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
         )
