@@ -81,8 +81,12 @@ class GSPOConfig:
 
     # Memory-first knobs.
     freeze_preprocessor: bool = True
-    freeze_encoder: bool = True
-    encoder_no_grad: bool = True
+    # If True, encoder parameters will not be updated and encoder forward will run under `torch.no_grad()`.
+    # Default is False to match standard fine-tuning expectations; enable it to save memory.
+    freeze_encoder: bool = False
+    # If True, encoder forward runs under `torch.no_grad()` (even if `freeze_encoder=False`).
+    # This is a memory-saving option but it will prevent encoder updates.
+    encoder_no_grad: bool = False
 
     # Safety: Lightning may call `model.train()` and re-enable `.training=True` on all submodules,
     # even if they are frozen (`requires_grad=False`). This can re-enable dropout in the encoder,
@@ -166,12 +170,15 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             _freeze_module(self.preprocessor)
             self.preprocessor.eval()
 
-        if self.gspo_cfg.get("freeze_encoder", True):
+        if self.gspo_cfg.get("freeze_encoder", False):
             _freeze_module(self.encoder)
             self.encoder.eval()
 
-        # Encoder outputs should not carry a graph (even if something upstream is trainable).
-        self._encoder_no_grad = bool(self.gspo_cfg.get("encoder_no_grad", True))
+        # Encoder forward should avoid graph creation when the encoder is not being trained.
+        self._train_encoder = not bool(self.gspo_cfg.get("freeze_encoder", False)) and not bool(
+            self.gspo_cfg.get("encoder_no_grad", False)
+        )
+        self._encoder_no_grad = (not self._train_encoder) or bool(self.gspo_cfg.get("encoder_no_grad", False))
 
     def _build_reward_fn(self):
         """
@@ -360,8 +367,18 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             )
             self.loss.reduction = loss_reduction
         else:
+            # Align target length semantics with NeMo's standard RNNT/TDT training path:
+            # - Decoder returns `dec_lens` (typically equal to the passed-in `target_lens`)
+            # - RNNTLoss expects transcript lengths *without* the implicit SOS added inside the decoder.
+            if not torch.equal(dec_lens, target_lens):
+                raise RuntimeError(
+                    "RNNTDecoder returned a target_length different from the provided `target_lens`. "
+                    "Please verify target length semantics to avoid off-by-one errors."
+                )
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=dec)
-            nll = self._gspo_nll(log_probs=joint, targets=targets, input_lengths=encoded_len, target_lengths=dec_lens)
+            nll = self._gspo_nll(
+                log_probs=joint, targets=targets, input_lengths=encoded_len, target_lengths=target_lens
+            )
 
         # `reduction=None` => Tensor[B]; B==1 here.
         return -nll.squeeze(0)
@@ -376,7 +393,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         if self.gspo_cfg.get("enforce_eval_on_frozen_modules", True):
             if self.gspo_cfg.get("freeze_preprocessor", True):
                 self.preprocessor.eval()
-            if self.gspo_cfg.get("freeze_encoder", True):
+            # Encoder dropout must be disabled when the encoder is not being trained (frozen or no-grad),
+            # otherwise GSPO rollouts/logp become non-deterministic.
+            if not self._train_encoder:
                 self.encoder.eval()
 
         if self.gspo_cfg.get("disable_decoder_dropout", True):
@@ -400,9 +419,11 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         ref_token_ids = transcript[0, : int(transcript_len.item())].tolist()
         ref_text = self._tokens_to_text(ref_token_ids)
 
-        # 1) Encode once and detach encoder outputs (memory-first).
+        # 1) Encode once.
         encoded, encoded_len = self._encode_one(signal, signal_len)
-        encoded = encoded.detach()
+        # Detach encoder outputs if encoder is not being trained (saves memory and avoids accidental grads).
+        if not self._train_encoder:
+            encoded = encoded.detach()
 
         # 2) Rollout: beam decode n-best hypotheses from cached encoder outputs.
         with torch.no_grad():
