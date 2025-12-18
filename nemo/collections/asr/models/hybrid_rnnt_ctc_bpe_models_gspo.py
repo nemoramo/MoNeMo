@@ -57,6 +57,7 @@ from nemo.collections.asr.losses.rnnt import RNNTLoss
 from nemo.collections.asr.models.hybrid_rnnt_ctc_bpe_models import EncDecHybridRNNTCTCBPEModel
 from nemo.collections.asr.parts.rl.rewards import TextErrorRateReward, TextRewardComponent, WeightedSumTextReward
 from nemo.collections.asr.parts.utils.rnnt_utils import Hypothesis
+from nemo.utils import logging
 
 
 @dataclass
@@ -230,6 +231,14 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         )
         self._encoder_no_grad = (not self._train_encoder) or bool(self.gspo_cfg.get("encoder_no_grad", False))
         self._gspo_fused_logp_validation_ran = False
+        self._gspo_blank_id: Optional[int] = None
+        self._gspo_blank_id_source: Optional[str] = None
+
+        blank_id, blank_id_source = self._resolve_blank_id()
+        self._gspo_blank_id = blank_id
+        self._gspo_blank_id_source = blank_id_source
+        if trainer is None or getattr(trainer, "is_global_zero", True):
+            logging.info(f"GSPO blank_id resolved: {blank_id} (source={blank_id_source})")
 
     def _build_reward_fn(self):
         """
@@ -339,6 +348,84 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             reduction=None,  # critical for sequence-level logp
         )
 
+    def _resolve_tokenizer_vocab_size(self) -> Tuple[Optional[int], Optional[str]]:
+        """
+        Best-effort tokenizer vocab size resolver.
+
+        Returns:
+            vocab_size, source_str
+        """
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is None:
+            return None, None
+
+        # Common NeMo tokenizers expose `vocab_size` directly (e.g., SentencePieceTokenizer sets an int attribute).
+        if hasattr(tokenizer, "vocab_size"):
+            try:
+                vocab_size = getattr(tokenizer, "vocab_size")
+                vocab_size = vocab_size() if callable(vocab_size) else vocab_size
+                return int(vocab_size), "tokenizer.vocab_size"
+            except Exception:
+                pass
+
+        # Some wrappers expose the underlying tokenizer instance as `tokenizer.tokenizer`.
+        inner = getattr(tokenizer, "tokenizer", None)
+        if inner is not None:
+            if hasattr(inner, "vocab_size"):
+                try:
+                    vocab_size = getattr(inner, "vocab_size")
+                    vocab_size = vocab_size() if callable(vocab_size) else vocab_size
+                    return int(vocab_size), "tokenizer.tokenizer.vocab_size"
+                except Exception:
+                    pass
+
+            # SentencePieceProcessor typically provides `get_piece_size()`.
+            if hasattr(inner, "get_piece_size"):
+                try:
+                    return int(inner.get_piece_size()), "tokenizer.tokenizer.get_piece_size()"
+                except Exception:
+                    pass
+
+        return None, None
+
+    def _resolve_blank_id(self) -> Tuple[int, str]:
+        """
+        Resolve the blank token id (or "blank threshold" for TDT) for hypothesis filtering.
+
+        Prefer `decoding.blank_id` when available; otherwise fall back to model/loss/tokenizer metadata.
+        """
+        blank_id = getattr(self.decoding, "blank_id", None)
+        if isinstance(blank_id, int):
+            return int(blank_id), "decoding.blank_id"
+
+        # RNNTLoss stores the blank index as a private attribute `_blank` (set from `num_classes`).
+        blank_id = getattr(self._gspo_nll, "_blank", None)
+        if isinstance(blank_id, int):
+            return int(blank_id), "_gspo_nll._blank"
+
+        # Joint knows the full output dimension (including blank and extra outputs).
+        if hasattr(self, "joint") and hasattr(self.joint, "num_classes_with_blank"):
+            is_tdt = bool(getattr(self.decoding, "_is_tdt", False))
+            if is_tdt and hasattr(self.joint, "num_extra_outputs"):
+                # For TDT, treat the "blank id" as a threshold that filters out duration outputs as well.
+                # `num_classes_with_blank = V + 1 + extra`, so vocab size V is:
+                #   V = num_classes_with_blank - 1 - num_extra_outputs
+                return (
+                    int(self.joint.num_classes_with_blank - 1 - self.joint.num_extra_outputs),
+                    "joint.num_classes_with_blank - 1 - joint.num_extra_outputs",
+                )
+            return int(self.joint.num_classes_with_blank - 1), "joint.num_classes_with_blank - 1"
+
+        vocab_size, vocab_source = self._resolve_tokenizer_vocab_size()
+        if vocab_size is not None:
+            return int(vocab_size), f"{vocab_source} (fallback)"
+
+        raise RuntimeError(
+            "Could not resolve blank_id for hypothesis filtering.\n"
+            "Expected `self.decoding.blank_id`, `self._gspo_nll._blank`, or a tokenizer vocab size.\n"
+            f"decoding={type(self.decoding).__name__} tokenizer={type(getattr(self, 'tokenizer', None)).__name__}"
+        )
+
     def _strip_special_token_ids(self, token_ids: List[int]) -> List[int]:
         pad_id = getattr(self.tokenizer, "pad_id", None)
         bos_id = getattr(self.tokenizer, "bos_id", None)
@@ -362,7 +449,12 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         token_ids = hyp.y_sequence.tolist() if isinstance(hyp.y_sequence, torch.Tensor) else list(hyp.y_sequence)
         blank_id = getattr(self.decoding, "blank_id", None)
         if blank_id is None:
-            blank_id = self.tokenizer.tokenizer.vocab_size
+            blank_id = self._gspo_blank_id
+        if blank_id is None:
+            blank_id, blank_id_source = self._resolve_blank_id()
+            self._gspo_blank_id = blank_id
+            self._gspo_blank_id_source = blank_id_source
+            logging.info(f"GSPO blank_id resolved lazily: {blank_id} (source={blank_id_source})")
 
         # Align with `RNNTBPEDecoding.decode_hypothesis()` filtering logic:
         # - TDT: drop blank + duration outputs (>= blank_id)
@@ -792,8 +884,6 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         # Optional: compact text logs for quick debugging (global rank 0 only).
         if do_print and getattr(self.trainer, "is_global_zero", True):
-            from nemo.utils import logging
-
             msg = (
                 f"GSPO step={int(self.global_step)} "
                 f"loss={loss.detach().float().item():.4f} "
