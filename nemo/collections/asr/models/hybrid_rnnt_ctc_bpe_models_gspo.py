@@ -428,10 +428,26 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             # Align target length semantics with NeMo's standard RNNT/TDT training path:
             # - Decoder returns `dec_lens` (typically equal to the passed-in `target_lens`)
             # - RNNTLoss expects transcript lengths *without* the implicit SOS added inside the decoder.
-            if not torch.equal(dec_lens, target_lens):
+            # NOTE: Some decoder implementations may return lengths with different dtype (int32 vs int64) or
+            # different semantics (e.g., U+1 when including SOS). Keep this as fail-fast, but make it diagnostic.
+            dec_lens_long = dec_lens.to(dtype=torch.long)
+            target_lens_long = target_lens.to(dtype=torch.long)
+            if not torch.equal(dec_lens_long, target_lens_long):
+                dec_list = dec_lens_long.detach().cpu().tolist()
+                tgt_list = target_lens_long.detach().cpu().tolist()
+                delta = [int(d - t) for d, t in zip(dec_list, tgt_list)]
+
+                loss_name, _ = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+                decoding_model_type = getattr(getattr(self.cfg, "decoding", None), "model_type", None)
+                is_tdt = bool(getattr(self.decoding, "_is_tdt", False))
+
                 raise RuntimeError(
                     "RNNTDecoder returned a target_length different from the provided `target_lens`. "
-                    "Please verify target length semantics to avoid off-by-one errors."
+                    "Please verify target length semantics to avoid off-by-one errors.\n"
+                    f"dec_lens={dec_list} target_lens={tgt_list} delta(dec-target)={delta}\n"
+                    f"dec_lens_dtype={dec_lens.dtype} target_lens_dtype={target_lens.dtype}\n"
+                    f"loss_name={loss_name} decoding_model_type={decoding_model_type} is_tdt={is_tdt}\n"
+                    f"decoder={type(self.decoder).__name__} decoding={type(self.decoding).__name__}"
                 )
             joint = self.joint(encoder_outputs=encoded, decoder_outputs=dec)
             nll = self._gspo_nll(
