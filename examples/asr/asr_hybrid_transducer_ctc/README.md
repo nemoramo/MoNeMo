@@ -30,3 +30,18 @@ graph TD
 ```
 
 During restoration of the model, you may pass the Trainer to the restore_from / from_pretrained call, or set it after the model has been initialized by using `model.set_trainer(Trainer)`.
+
+## GSPO post-training (Hybrid TDT+CTC BPE)
+
+This repo also includes a minimal, memory-first GSPO post-training example for Hybrid TDT+CTC BPE models:
+
+- Script: `examples/asr/asr_hybrid_transducer_ctc/post_train_gspo_tdt_ctc_bpe.py`
+- Config: `examples/asr/conf/fastconformer/hybrid_transducer_ctc/fastconformer_hybrid_tdt_ctc_bpe_gspo.yaml`
+
+The implementation is intentionally "slow but small" (freeze encoder + `batch_size=1` + grad accumulation) and uses
+n-best beam hypotheses plus sequence-level importance ratios.
+
+References:
+- PPO (clipped objective): https://arxiv.org/abs/1707.06347
+- TDT (Token-and-Duration Transducer): https://arxiv.org/abs/2304.06795
+- GSPO discussion: https://arxiv.org/pdf/2507.18071

@@ -1,0 +1,71 @@
+# GSPO post-training config (memory-first, slow OK).
+#
+# This config composes the standard training config and overrides only the parts
+# needed for GSPO post-training.
+#
+# References:
+# - PPO: https://arxiv.org/abs/1707.06347
+# - TDT: https://arxiv.org/abs/2304.06795
+# - GSPO discussion: https://arxiv.org/pdf/2507.18071
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+  - _self_
+
+name: "FastConformer-Hybrid-TDT-CTC-BPE-GSPO"
+
+model:
+  # Optional: disable spec augmentation during post-training for stable reward signal.
+  spec_augment: null
+
+  # GSPO knobs (consumed by EncDecHybridRNNTCTCBPEModelGSPO).
+  gspo:
+    clip_eps: 0.2
+    group_size: 4
+    # Unified reward interface (supports multiple reward terms with weights).
+    # Default: verifiable reward = 1 - WER.
+    reward:
+      components:
+        - name: wer
+          weight: 1.0
+          use_cer: false
+          one_minus_error: true
+    normalize_advantage: true
+    advantage_eps: 1e-8
+    sft_weight: 0.05
+
+    # Memory-first defaults.
+    freeze_preprocessor: true
+    freeze_encoder: true
+    encoder_no_grad: true
+
+    # Stability: disable dropout during rollout/logp computations.
+    disable_decoder_dropout: true
+    disable_joint_dropout: true
+
+  # GSPO requires n-best hypotheses (beam + return_best_hypothesis=False).
+  decoding:
+    strategy: "beam"
+    beam:
+      beam_size: ${model.gspo.group_size}
+      return_best_hypothesis: False
+
+  # Memory-first: batch_size=1 + gradient accumulation.
+  train_ds:
+    batch_size: 1
+
+  # Post-training targets RNNT/TDT branch only (no aux CTC loss).
+  aux_ctc:
+    ctc_loss_weight: 0.0
+
+  # Keep fused joint+loss enabled (works with GSPO via per-hypothesis loss calls).
+  joint:
+    preserve_memory: true
+    fuse_loss_wer: true
+    fused_batch_size: 1
+
+trainer:
+  # Increase this to emulate a larger effective batch size.
+  accumulate_grad_batches: 16
+  # Use `bf16` if supported, else `16`.
+  precision: bf16
