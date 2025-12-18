@@ -589,7 +589,12 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         return -nll.squeeze(0)
 
     def _compute_logp_batch(
-        self, encoded: torch.Tensor, encoded_len: torch.Tensor, token_ids_list: List[List[int]]
+        self,
+        encoded: torch.Tensor,
+        encoded_len: torch.Tensor,
+        token_ids_list: List[List[int]],
+        *,
+        compute_diagnostics: bool = False,
     ) -> torch.Tensor:
         """
         Compute log p(y|x) for a batch of hypotheses.
@@ -624,6 +629,42 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         encoded_len_batch = encoded_len.expand(k)
 
         dec, dec_lens, _ = self.decoder(targets=targets, target_length=target_lens)
+        if compute_diagnostics and bool(self.gspo_cfg.get("debug_check_batch_lens", True)):
+            # Diagnostics-only semantic checks to catch silent off-by-one / length-definition bugs.
+            # - In most NeMo RNNT/TDT decoders, `dec_lens` equals `target_lens` (no SOS counted in lengths),
+            #   while the decoder output time dimension is `max(target_lens)+1` (SOS is prepended in the output).
+            # - If your decoder differs, these checks should fail fast so we don't silently compute wrong logp.
+            expected_u = int(target_lens.max().item()) + 1
+            got_u = int(dec.shape[-1])
+
+            dec_lens_long = dec_lens.to(dtype=torch.long) if dec_lens is not None else None
+            target_lens_long = target_lens.to(dtype=torch.long)
+
+            if got_u != expected_u:
+                raise RuntimeError(
+                    "Batched logp: decoder output U dimension mismatch. "
+                    "Expected U == max(target_lens)+1 (SOS in decoder outputs).\n"
+                    f"got_U={got_u} expected_U={expected_u} target_lens={target_lens_long.detach().cpu().tolist()}\n"
+                    f"decoder={type(self.decoder).__name__}"
+                )
+
+            if dec_lens_long is not None and not torch.equal(dec_lens_long, target_lens_long):
+                dec_list = dec_lens_long.detach().cpu().tolist()
+                tgt_list = target_lens_long.detach().cpu().tolist()
+                delta = [int(d - t) for d, t in zip(dec_list, tgt_list)]
+
+                loss_name, _ = self.extract_rnnt_loss_cfg(self.cfg.get("loss", None))
+                decoding_model_type = getattr(getattr(self.cfg, "decoding", None), "model_type", None)
+                is_tdt = bool(getattr(self.decoding, "_is_tdt", False))
+
+                raise RuntimeError(
+                    "Batched logp: RNNTDecoder returned a target_length different from provided `target_lens`. "
+                    "Please verify target length semantics to avoid off-by-one errors.\n"
+                    f"dec_lens={dec_list} target_lens={tgt_list} delta(dec-target)={delta}\n"
+                    f"dec_lens_dtype={dec_lens.dtype} target_lens_dtype={target_lens.dtype}\n"
+                    f"loss_name={loss_name} decoding_model_type={decoding_model_type} is_tdt={is_tdt}\n"
+                    f"decoder={type(self.decoder).__name__} decoding={type(self.decoding).__name__}"
+                )
 
         if self.joint.fuse_loss_wer:
             # Use fused Joint+Loss path to avoid materializing `joint` outside this scope.
@@ -900,7 +941,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         t2 = time.perf_counter()
         with torch.no_grad():
             if use_batch:
-                logp_old = self._compute_logp_batch(encoded, encoded_len, hyp_token_ids_list).detach()
+                logp_old = self._compute_logp_batch(
+                    encoded, encoded_len, hyp_token_ids_list, compute_diagnostics=compute_diagnostics
+                ).detach()
             else:
                 logp_old_list: List[torch.Tensor] = []
                 for token_ids in hyp_token_ids_list:
@@ -913,7 +956,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         t3 = time.perf_counter()
         if use_batch:
-            logp_new = self._compute_logp_batch(encoded, encoded_len, hyp_token_ids_list)
+            logp_new = self._compute_logp_batch(
+                encoded, encoded_len, hyp_token_ids_list, compute_diagnostics=compute_diagnostics
+            )
         else:
             logp_new_list: List[torch.Tensor] = []
             for token_ids in hyp_token_ids_list:
