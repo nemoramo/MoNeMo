@@ -464,7 +464,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             token_ids = [t for t in token_ids if t < blank_id]
         else:
             token_ids = [t for t in token_ids if t != blank_id]
-        return token_ids
+        # Strip special tokens (BOS/EOS/PAD) to match the target tokenization semantics used in training.
+        return self._strip_special_token_ids(token_ids)
 
     def _encode_one(self, signal: torch.Tensor, signal_len: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         """
@@ -719,14 +720,16 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         # 3) Compute rewards and advantages on CPU-ish (tiny tensors).
         hyp_token_ids_list: List[List[int]] = [self._hypothesis_to_token_ids(hyp) for hyp in hyps]
-        hyp_texts: List[str] = []
-        for hyp, token_ids in zip(hyps, hyp_token_ids_list):
-            # NOTE: `Hypothesis.text` is not guaranteed to be populated for all decoding paths/configs.
-            # Fall back to deterministic token-id decoding to avoid silently computing rewards on empty strings.
-            hyp_text = getattr(hyp, "text", None)
-            if not hyp_text:
-                hyp_text = self._tokens_to_text(token_ids)
-            hyp_texts.append(str(hyp_text).strip())
+        empty_hyp_count = sum(1 for ids in hyp_token_ids_list if len(ids) == 0)
+        # NOTE: Some decoders may produce empty token sequences (e.g., blank-only). This is rare but can be a
+        # canary for decoding/token filtering issues. We track it and can decide later whether to skip such hyps
+        # or assign a small logp instead of the current `logp=0` placeholder.
+        # TODO: Decide on a principled empty-hypothesis handling policy (skip vs. explicit empty-sequence logp).
+
+        # Decode hypothesis text from token ids so reward and logp always correspond to the same sequence.
+        hyp_texts: List[str] = [self._tokens_to_text(ids) for ids in hyp_token_ids_list]
+        group_size = len(hyp_texts)
+        uniq_hyp_count = len(set(hyp_texts))
 
         rewards = torch.tensor(
             [self._reward_from_text(t, ref_text) for t in hyp_texts], device=device, dtype=torch.float32
@@ -787,6 +790,18 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         metrics["gspo_rl_loss"] = rl_loss.detach()
         metrics["gspo_reward_mean"] = rewards.mean().detach()
         metrics["gspo_reward_std"] = rewards.std(unbiased=False).detach()
+        metrics["gspo_group_size"] = torch.tensor(float(group_size), device=device, dtype=torch.float32)
+        metrics["gspo_uniq_hyp_count"] = torch.tensor(float(uniq_hyp_count), device=device, dtype=torch.float32)
+        metrics["gspo_uniq_hyp_frac"] = torch.tensor(
+            float(uniq_hyp_count) / float(max(1, group_size)), device=device, dtype=torch.float32
+        )
+        metrics["gspo_dup_frac"] = torch.tensor(
+            1.0 - (float(uniq_hyp_count) / float(max(1, group_size))), device=device, dtype=torch.float32
+        )
+        metrics["gspo_empty_hyp_count"] = torch.tensor(float(empty_hyp_count), device=device, dtype=torch.float32)
+        metrics["gspo_empty_hyp_frac"] = torch.tensor(
+            float(empty_hyp_count) / float(max(1, len(hyp_token_ids_list))), device=device, dtype=torch.float32
+        )
 
         # NOTE: In the current "on-policy single-step" mode, `train_loss` / `gspo_rl_loss` can be close to 0 because
         # advantages are mean-zero (and often normalized). This does NOT imply gradients are zero.
@@ -804,20 +819,16 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         clip_eps = float(self.gspo_cfg.clip_eps)
         metrics["gspo_ratio_mean"] = ratio.mean()
         metrics["gspo_ratio_std"] = ratio.std(unbiased=False)
+        metrics["gspo_ratio_max"] = ratio.max()
         metrics["gspo_clip_frac"] = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
         metrics["gspo_approx_kl"] = (logp_old_detached - logp_new_detached).mean()
+        metrics["gspo_logp_span"] = (logp_old_detached.max() - logp_old_detached.min())
+        metrics["gspo_best_reward_minus_mean"] = (rewards.max() - rewards.mean()).detach()
 
         if compute_diagnostics:
             metrics.update(self._maybe_validate_fused_logp(encoded=encoded, encoded_len=encoded_len, token_ids=ref_token_ids))
 
             # N-best group diagnostics.
-            k = max(1, len(hyp_texts))
-            uniq = len(set(hyp_texts))
-            uniq_frac = float(uniq) / float(k)
-            metrics["gspo_uniq_hyp_frac"] = torch.tensor(uniq_frac, device=device, dtype=torch.float32)
-            metrics["gspo_dup_frac"] = torch.tensor(1.0 - uniq_frac, device=device, dtype=torch.float32)
-            metrics["gspo_best_reward_minus_mean"] = (rewards.max() - rewards.mean()).detach()
-
             hyp_lens = torch.tensor([len(ids) for ids in hyp_token_ids_list], device=device, dtype=torch.float32)
             metrics["gspo_hyp_len_mean"] = hyp_lens.mean()
             metrics["gspo_hyp_len_std"] = hyp_lens.std(unbiased=False)
@@ -892,14 +903,23 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             "gspo_rl_loss",
             "gspo_reward_mean",
             "gspo_reward_std",
+            "gspo_best_reward_minus_mean",
+            "gspo_group_size",
+            "gspo_uniq_hyp_count",
+            "gspo_uniq_hyp_frac",
+            "gspo_dup_frac",
+            "gspo_empty_hyp_count",
+            "gspo_empty_hyp_frac",
             "gspo_adv_mean",
             "gspo_adv_std",
             "gspo_logp_old_mean",
             "gspo_logp_old_std",
             "gspo_logp_new_mean",
             "gspo_logp_new_std",
+            "gspo_logp_span",
             "gspo_ratio_mean",
             "gspo_ratio_std",
+            "gspo_ratio_max",
             "gspo_clip_frac",
             "gspo_approx_kl",
         }
