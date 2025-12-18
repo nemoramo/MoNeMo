@@ -183,10 +183,21 @@ def gspo_clipped_loss_seq(
     Returns:
         Scalar loss (to minimize).
     """
-    ratio = torch.exp(logp_new - logp_old)
+    # Numerical stability (bf16/fp16 friendly):
+    # - Cast BEFORE subtraction to preserve small deltas (and reduce quantization).
+    # - Compute exp in fp32.
+    # - Clamp delta to avoid exp overflow in fp32 (overflow starts around ~88).
+    logp_new_f = logp_new.to(dtype=torch.float32)
+    logp_old_f = logp_old.to(dtype=torch.float32)
+    adv_f = advantages.to(dtype=torch.float32)
+
+    delta = logp_new_f - logp_old_f
+    delta = delta.clamp(min=-80.0, max=80.0)
+
+    ratio = torch.exp(delta)
     ratio_clipped = torch.clamp(ratio, 1.0 - clip_eps, 1.0 + clip_eps)
-    obj1 = ratio * advantages
-    obj2 = ratio_clipped * advantages
+    obj1 = ratio * adv_f
+    obj2 = ratio_clipped * adv_f
     return (-torch.minimum(obj1, obj2)).mean()
 
 
@@ -814,15 +825,17 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         metrics["gspo_logp_new_mean"] = logp_new_detached.mean()
         metrics["gspo_logp_new_std"] = logp_new_detached.std(unbiased=False)
 
-        log_ratio = (logp_new_detached - logp_old_detached).clamp(min=-20.0, max=20.0)
+        logp_old_f = logp_old_detached.to(dtype=torch.float32)
+        logp_new_f = logp_new_detached.to(dtype=torch.float32)
+        log_ratio = (logp_new_f - logp_old_f).clamp(min=-80.0, max=80.0)
         ratio = torch.exp(log_ratio)
         clip_eps = float(self.gspo_cfg.clip_eps)
         metrics["gspo_ratio_mean"] = ratio.mean()
         metrics["gspo_ratio_std"] = ratio.std(unbiased=False)
         metrics["gspo_ratio_max"] = ratio.max()
         metrics["gspo_clip_frac"] = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
-        metrics["gspo_approx_kl"] = (logp_old_detached - logp_new_detached).mean()
-        metrics["gspo_logp_span"] = (logp_old_detached.max() - logp_old_detached.min())
+        metrics["gspo_approx_kl"] = (logp_old_f - logp_new_f).mean()
+        metrics["gspo_logp_span"] = (logp_old_f.max() - logp_old_f.min())
         metrics["gspo_best_reward_minus_mean"] = (rewards.max() - rewards.mean()).detach()
 
         if compute_diagnostics:
