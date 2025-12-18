@@ -49,6 +49,11 @@ model:
     log_diagnostics: true
     log_diagnostics_every_n_steps: 50
     log_text_every_n_steps: 50
+    # Under grad accumulation, run expensive diagnostics/prints/one-time validations at most once per optimizer step.
+    diagnostics_once_per_global_step: true
+    # Distributed logging controls (DDP).
+    sync_dist_core_metrics: true
+    sync_dist_extra_metrics: true
     # Optional (slower): record coarse encode/decode/logp timings.
     # log_timings: true
     # timing_sync_cuda: false
@@ -61,6 +66,16 @@ model:
     # validate_fused_logp_once: true
     # validate_fused_logp_max_joint_elements: 50000000
 
+    # Roadmap: PPO epochs (sample reuse). Not implemented yet; keep at 1.
+    ppo_epochs: 1
+
+    # Optimization: Batch N-best hypotheses for logp computation.
+    # Faster but uses more memory.
+    batch_hypotheses: false
+
+    # Penalty logp for empty hypotheses (e.g. -100.0).
+    empty_hyp_logp: -100.0
+
     # Alternative: allow encoder fine-tuning (higher memory).
     # freeze_encoder: false
     # encoder_no_grad: false
@@ -70,11 +85,9 @@ model:
     # and behaves like an on-policy sequence-level policy-gradient / MWER-style objective.
     #
     # Future options (not implemented yet; shown here as a roadmap):
-    # - PPO epochs (sample reuse): rollout once, cache logp_old, do multiple updates by recomputing logp_new.
     # - Old-policy snapshot: maintain a lagged copy of decoder/joint as pi_old (sync every N steps).
     # - KL regularization: add optional KL-to-reference to control drift.
     #
-    # ppo_epochs: 4
     # old_policy_sync_interval: 500
     # kl_beta: 0.01
 

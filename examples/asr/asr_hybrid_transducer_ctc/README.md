@@ -1,8 +1,8 @@
 # ASR with Hybrid Transducer/CTC Models
 
-This directory contains example scripts to train ASR models with two decoders of Transducer and CTC Loss. 
+This directory contains example scripts to train ASR models with two decoders of Transducer and CTC Loss.
 
-Currently supported models are - 
+Currently supported models are -
 
 * Character based Hybrid RNNT/CTC model
 * Subword based Hybrid RNNT/CTC model
@@ -47,6 +47,10 @@ Important note (PPO semantics):
   In practice, the importance ratio is ~1 and the update behaves like a sequence-level on-policy policy gradient /
   MWER-style risk minimization objective, wrapped in a PPO-shaped loss.
 - The code/config are structured so we can extend toward stricter PPO/GSPO later (PPO epochs / old-policy snapshot / KL).
+- **Optimization**:
+  - `ppo_epochs`: Roadmap only (keep `1` for now; `>1` is not implemented yet in the default Lightning path).
+  - `batch_hypotheses`: Set to `true` to batch N-best hypotheses for faster logp computation (uses more memory).
+  - `empty_hyp_logp`: Penalty logp for empty hypotheses (default -100.0).
 
 References:
 - PPO (clipped objective): https://arxiv.org/abs/1707.06347

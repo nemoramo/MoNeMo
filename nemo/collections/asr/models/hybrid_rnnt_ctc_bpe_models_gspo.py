@@ -124,6 +124,14 @@ class GSPOConfig:
     log_grad_norm: bool = False
     grad_norm_every_n_steps: int = 50
 
+    # Ensure expensive diagnostics/printing run at most once per optimizer step (global_step),
+    # which is important under gradient accumulation.
+    diagnostics_once_per_global_step: bool = True
+
+    # Distributed logging controls (useful when running DDP; keep defaults to preserve current behavior).
+    sync_dist_core_metrics: bool = True
+    sync_dist_extra_metrics: bool = True
+
     # One-time hard validation (optional):
     # Verify that the fused joint+loss path returns per-sample NLL consistent with a reference computation
     # that materializes the joint tensor and calls the loss directly.
@@ -132,6 +140,17 @@ class GSPOConfig:
     validate_fused_logp_once: bool = False
     # Approximate upper bound on joint output elements (B * T * U * V) allowed for validation.
     validate_fused_logp_max_joint_elements: int = 50_000_000
+
+    # Roadmap: PPO epochs (sample reuse).
+    # NOTE: `ppo_epochs>1` is not implemented yet in the automatic-optimization Lightning path.
+    ppo_epochs: int = 1
+
+    # Optimization: Batch N-best hypotheses for logp computation.
+    # Faster but uses more memory.
+    batch_hypotheses: bool = False
+
+    # Penalty logp for empty hypotheses (e.g. -100.0).
+    empty_hyp_logp: float = -100.0
 
 
 def _as_tensor_cfg(cfg: Optional[DictConfig], schema: GSPOConfig) -> DictConfig:
@@ -217,6 +236,13 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         # Resolve GSPO config.
         self.gspo_cfg: DictConfig = _as_tensor_cfg(self.cfg.get("gspo", None), GSPOConfig())
+        ppo_epochs = int(self.gspo_cfg.get("ppo_epochs", 1))
+        if ppo_epochs != 1:
+            raise NotImplementedError(
+                "`model.gspo.ppo_epochs>1` requires PPO-style sample reuse (multiple optimizer steps per rollout), "
+                "which is not implemented yet in this Lightning automatic-optimization GSPO trainer. "
+                "Keep `model.gspo.ppo_epochs=1` for now; see the TODO roadmap in this module."
+            )
 
         # Ensure decoding is configured for n-best rollouts (beam + return_best_hypothesis=False).
         self._configure_gspo_decoding()
@@ -244,6 +270,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         self._gspo_fused_logp_validation_ran = False
         self._gspo_blank_id: Optional[int] = None
         self._gspo_blank_id_source: Optional[str] = None
+        self._gspo_last_diagnostics_global_step: int = -1
 
         blank_id, blank_id_source = self._resolve_blank_id()
         self._gspo_blank_id = blank_id
@@ -500,7 +527,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         """
         # TODO: Decide how to handle empty hypotheses (rare, but possible for very short/noisy audio).
         if len(token_ids) == 0:
-            return torch.tensor(0.0, device=encoded.device, dtype=torch.float32)
+            return torch.tensor(float(self.gspo_cfg.get("empty_hyp_logp", -100.0)), device=encoded.device, dtype=torch.float32)
 
         targets = torch.tensor(token_ids, device=encoded.device, dtype=torch.long).unsqueeze(0)
         target_lens = torch.tensor([len(token_ids)], device=encoded.device, dtype=torch.long)
@@ -561,6 +588,84 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         # `reduction=None` => Tensor[B]; B==1 here.
         return -nll.squeeze(0)
 
+    def _compute_logp_batch(
+        self, encoded: torch.Tensor, encoded_len: torch.Tensor, token_ids_list: List[List[int]]
+    ) -> torch.Tensor:
+        """
+        Compute log p(y|x) for a batch of hypotheses.
+        Returns: Tensor[K]
+        """
+        # Handle empty hypotheses
+        non_empty_indices = []
+        empty_indices = []
+        for i, ids in enumerate(token_ids_list):
+            if len(ids) > 0:
+                non_empty_indices.append(i)
+            else:
+                empty_indices.append(i)
+
+        empty_hyp_logp = float(self.gspo_cfg.get("empty_hyp_logp", -100.0))
+        if not non_empty_indices:
+            return torch.full((len(token_ids_list),), empty_hyp_logp, device=encoded.device, dtype=torch.float32)
+
+        # Prepare batch for non-empty
+        batch_ids = [token_ids_list[i] for i in non_empty_indices]
+        max_u = max(len(ids) for ids in batch_ids)
+        k = len(batch_ids)
+
+        targets = torch.zeros((k, max_u), device=encoded.device, dtype=torch.long)
+        target_lens = torch.tensor([len(ids) for ids in batch_ids], device=encoded.device, dtype=torch.long)
+
+        for i, ids in enumerate(batch_ids):
+            targets[i, : len(ids)] = torch.tensor(ids, device=encoded.device, dtype=torch.long)
+
+        # Expand encoder outputs: [1, T, D] -> [K, T, D]
+        encoded_batch = encoded.expand(k, -1, -1)
+        encoded_len_batch = encoded_len.expand(k)
+
+        dec, dec_lens, _ = self.decoder(targets=targets, target_length=target_lens)
+
+        if self.joint.fuse_loss_wer:
+            # Use fused Joint+Loss path to avoid materializing `joint` outside this scope.
+            joint_loss = getattr(self.joint, "loss", None)
+            if joint_loss is None:
+                raise RuntimeError(
+                    "`joint.fuse_loss_wer=True` but `joint.loss` is None; cannot compute per-sample logp."
+                )
+
+            loss_reduction = joint_loss.reduction
+            try:
+                joint_loss.reduction = None
+                nll, _, _, _ = self.joint(
+                    encoder_outputs=encoded_batch,
+                    decoder_outputs=dec,
+                    encoder_lengths=encoded_len_batch,
+                    transcripts=targets,
+                    transcript_lengths=target_lens,
+                    compute_wer=False,
+                )
+            finally:
+                joint_loss.reduction = loss_reduction
+        else:
+            # Standard path
+            joint = self.joint(encoder_outputs=encoded_batch, decoder_outputs=dec)
+            nll = self._gspo_nll(
+                log_probs=joint, targets=targets, input_lengths=encoded_len_batch, target_lengths=target_lens
+            )
+
+        logp_non_empty = -nll  # `reduction=None` => Tensor[K_non_empty]
+
+        # Reconstruct full K-sized list while preserving gradients for non-empty hypotheses.
+        out: List[torch.Tensor] = []
+        j = 0
+        for ids in token_ids_list:
+            if len(ids) == 0:
+                out.append(torch.tensor(empty_hyp_logp, device=encoded.device, dtype=torch.float32))
+            else:
+                out.append(logp_non_empty[j])
+                j += 1
+        return torch.stack(out, dim=0)
+
     def _maybe_validate_fused_logp(
         self, encoded: torch.Tensor, encoded_len: torch.Tensor, token_ids: List[int]
     ) -> Dict[str, torch.Tensor]:
@@ -583,11 +688,15 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         if self.trainer is not None and hasattr(self.trainer, "is_global_zero") and not self.trainer.is_global_zero:
             return {}
 
+        device = encoded.device
+        metrics: Dict[str, torch.Tensor] = {}
+
+        # Mark ran regardless of outcome to avoid repeated expensive work.
         self._gspo_fused_logp_validation_ran = True
 
         token_ids = self._strip_special_token_ids(token_ids)
         if len(token_ids) == 0:
-            return {"gspo_logp_validate_skipped": torch.tensor(1.0, device=encoded.device, dtype=torch.float32)}
+            return {"gspo_logp_validate_skipped": torch.tensor(1.0, device=device, dtype=torch.float32)}
 
         t = int(encoded_len.max().item())
         u = int(len(token_ids) + 1)  # decoder output length includes SOS
@@ -595,58 +704,84 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         approx_joint_numel = int(t * u * max(1, v))
 
         max_numel = int(self.gspo_cfg.get("validate_fused_logp_max_joint_elements", 50_000_000))
-        metrics: Dict[str, torch.Tensor] = {
-            "gspo_logp_validate_joint_numel": torch.tensor(float(approx_joint_numel), device=encoded.device),
-        }
+        metrics["gspo_logp_validate_joint_numel"] = torch.tensor(float(approx_joint_numel), device=device)
         if approx_joint_numel > max_numel:
-            metrics["gspo_logp_validate_skipped"] = torch.tensor(1.0, device=encoded.device, dtype=torch.float32)
+            metrics["gspo_logp_validate_skipped"] = torch.tensor(1.0, device=device, dtype=torch.float32)
             return metrics
 
         # Detach to avoid holding onto any graph from the main training path.
         encoded = encoded.detach()
 
-        with torch.no_grad():
-            targets = torch.tensor(token_ids, device=encoded.device, dtype=torch.long).unsqueeze(0)
-            target_lens = torch.tensor([len(token_ids)], device=encoded.device, dtype=torch.long)
-            dec, _, _ = self.decoder(targets=targets, target_length=target_lens)
+        try:
+            with torch.no_grad():
+                targets = torch.tensor(token_ids, device=device, dtype=torch.long).unsqueeze(0)
+                target_lens = torch.tensor([len(token_ids)], device=device, dtype=torch.long)
+                dec, _, _ = self.decoder(targets=targets, target_length=target_lens)
 
-            # Fused per-sample NLL (what GSPO uses when `fuse_loss_wer=True`).
-            joint_loss = getattr(self.joint, "loss", None)
-            if joint_loss is None:
-                raise RuntimeError("`joint.fuse_loss_wer=True` but `joint.loss` is None; cannot validate fused logp.")
-            loss_reduction = joint_loss.reduction
-            try:
-                joint_loss.reduction = None
-                nll_fused, _, _, _ = self.joint(
-                    encoder_outputs=encoded,
-                    decoder_outputs=dec,
-                    encoder_lengths=encoded_len,
-                    transcripts=targets,
-                    transcript_lengths=target_lens,
-                    compute_wer=False,
+                # Fused per-sample NLL (what GSPO uses when `fuse_loss_wer=True`).
+                joint_loss = getattr(self.joint, "loss", None)
+                if joint_loss is None:
+                    raise RuntimeError(
+                        "`joint.fuse_loss_wer=True` but `joint.loss` is None; cannot validate fused logp."
+                    )
+                loss_reduction = joint_loss.reduction
+                try:
+                    joint_loss.reduction = None
+                    nll_fused, _, _, _ = self.joint(
+                        encoder_outputs=encoded,
+                        decoder_outputs=dec,
+                        encoder_lengths=encoded_len,
+                        transcripts=targets,
+                        transcript_lengths=target_lens,
+                        compute_wer=False,
+                    )
+                finally:
+                    joint_loss.reduction = loss_reduction
+
+                # Reference NLL from explicit joint tensor + loss.
+                # NOTE: This materializes [B, T, U, V] tensors; keep it behind the size guard above.
+                #
+                # Important: On CUDA, NeMo's RNNT/TDT joint often returns logits (log_softmax is applied inside
+                # the GPU RNNT/TDT loss). Therefore we do not try to "fix" normalization here. The purpose of this
+                # validator is to compare fused vs non-fused semantics, not to validate logits-vs-log_probs.
+                fuse_flag = bool(getattr(self.joint, "_fuse_loss_wer", False))
+                try:
+                    self.joint._fuse_loss_wer = False
+                    joint_out = self.joint(encoder_outputs=encoded, decoder_outputs=dec)
+                finally:
+                    self.joint._fuse_loss_wer = fuse_flag
+
+                # Log a tiny logsumexp slice for debugging only (do not gate behavior on it).
+                try:
+                    t_sl = min(int(joint_out.shape[1]), 2)
+                    u_sl = min(int(joint_out.shape[2]), 2)
+                    metrics["gspo_logp_validate_joint_lse_mean"] = torch.logsumexp(
+                        joint_out[:, :t_sl, :u_sl, :].to(torch.float32), dim=-1
+                    ).mean()
+                except Exception:
+                    pass
+
+                nll_ref = self._gspo_nll(
+                    log_probs=joint_out, targets=targets, input_lengths=encoded_len, target_lengths=target_lens
                 )
-            finally:
-                joint_loss.reduction = loss_reduction
 
-            # Reference NLL from explicit joint tensor + loss.
-            # NOTE: This materializes [B, T, U, V] tensors; keep it behind the size guard above.
-            joint_out = self.joint.joint(encoded.transpose(1, 2), dec.transpose(1, 2))
-            nll_ref = self._gspo_nll(
-                log_probs=joint_out, targets=targets, input_lengths=encoded_len, target_lengths=target_lens
-            )
+            nll_fused = nll_fused.reshape(-1).to(torch.float32)
+            nll_ref = nll_ref.reshape(-1).to(torch.float32)
 
-        nll_fused = nll_fused.reshape(-1)
-        nll_ref = nll_ref.reshape(-1)
+            abs_err = (nll_fused - nll_ref).abs()
+            rel_err = abs_err / (nll_ref.abs() + 1e-8)
 
-        abs_err = (nll_fused - nll_ref).abs()
-        rel_err = abs_err / (nll_ref.abs() + 1e-8)
-
-        metrics["gspo_logp_validate_skipped"] = torch.tensor(0.0, device=encoded.device, dtype=torch.float32)
-        metrics["gspo_logp_validate_abs_err"] = abs_err.mean()
-        metrics["gspo_logp_validate_rel_err"] = rel_err.mean()
-        metrics["gspo_logp_validate_fused_nll"] = nll_fused.mean()
-        metrics["gspo_logp_validate_ref_nll"] = nll_ref.mean()
-        return metrics
+            metrics["gspo_logp_validate_skipped"] = torch.tensor(0.0, device=device, dtype=torch.float32)
+            metrics["gspo_logp_validate_failed"] = torch.tensor(0.0, device=device, dtype=torch.float32)
+            metrics["gspo_logp_validate_abs_err"] = abs_err.mean()
+            metrics["gspo_logp_validate_rel_err"] = rel_err.mean()
+            metrics["gspo_logp_validate_fused_nll"] = nll_fused.mean()
+            metrics["gspo_logp_validate_ref_nll"] = nll_ref.mean()
+            return metrics
+        except Exception:
+            metrics["gspo_logp_validate_skipped"] = torch.tensor(0.0, device=device, dtype=torch.float32)
+            metrics["gspo_logp_validate_failed"] = torch.tensor(1.0, device=device, dtype=torch.float32)
+            return metrics
 
     def _ensure_policy_eval_mode(self) -> None:
         """
@@ -679,23 +814,35 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         signal_len: torch.Tensor,
         transcript: torch.Tensor,
         transcript_len: torch.Tensor,
+        *,
         compute_diagnostics: bool,
         compute_timings: bool,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
-        GSPO objective for a single sample (batch size 1).
+        GSPO objective for a single sample.
+
+        Notes:
+        - This implementation intentionally recomputes `logp_old` and `logp_new` in separate passes even though
+          they are often numerically identical in the current on-policy single-step regime. This redundancy is a
+          useful "canary" to detect unintended stochasticity (e.g., dropout not fully disabled) and logp path drift.
+        - `ppo_epochs>1` is not implemented yet (see module docstring TODO roadmap).
         """
+        ppo_epochs = int(self.gspo_cfg.get("ppo_epochs", 1))
+        if ppo_epochs != 1:
+            raise NotImplementedError(
+                "GSPO PPO-epochs style sample reuse is not implemented yet in the automatic-optimization path. "
+                "See the TODO roadmap in `hybrid_rnnt_ctc_bpe_models_gspo.py`."
+            )
+
         device = signal.device
+        timings: Dict[str, float] = {}
 
         ref_token_ids = transcript[0, : int(transcript_len.item())].tolist()
         ref_text = self._tokens_to_text(ref_token_ids)
 
-        timings: Dict[str, float] = {}
-        t0 = time.perf_counter()
-
         # 1) Encode once.
+        t0 = time.perf_counter()
         encoded, encoded_len = self._encode_one(signal, signal_len)
-        # Detach encoder outputs if encoder is not being trained (saves memory and avoids accidental grads).
         if not self._train_encoder:
             encoded = encoded.detach()
         if compute_timings:
@@ -729,13 +876,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         if len(hyps) == 0:
             raise RuntimeError("Decoding returned an empty hypothesis list; check decoding config and inputs.")
 
-        # 3) Compute rewards and advantages on CPU-ish (tiny tensors).
+        # 3) Compute rewards and advantages (tiny tensors).
         hyp_token_ids_list: List[List[int]] = [self._hypothesis_to_token_ids(hyp) for hyp in hyps]
         empty_hyp_count = sum(1 for ids in hyp_token_ids_list if len(ids) == 0)
-        # NOTE: Some decoders may produce empty token sequences (e.g., blank-only). This is rare but can be a
-        # canary for decoding/token filtering issues. We track it and can decide later whether to skip such hyps
-        # or assign a small logp instead of the current `logp=0` placeholder.
-        # TODO: Decide on a principled empty-hypothesis handling policy (skip vs. explicit empty-sequence logp).
 
         # Decode hypothesis text from token ids so reward and logp always correspond to the same sequence.
         hyp_texts: List[str] = [self._tokens_to_text(ids) for ids in hyp_token_ids_list]
@@ -751,29 +894,36 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             advantages = rewards - rewards.mean()
         advantages_detached = advantages.detach()
 
-        # 4) Compute logp_old (no_grad baseline) and logp_new (with grad) one-by-one to reduce peak memory.
-        logp_old_list: List[torch.Tensor] = []
-        logp_new_list: List[torch.Tensor] = []
+        # 4) Compute logp_old (no_grad baseline) and logp_new (with grad).
+        use_batch = bool(self.gspo_cfg.get("batch_hypotheses", False))
 
         t2 = time.perf_counter()
         with torch.no_grad():
-            for token_ids in hyp_token_ids_list:
-                logp_old_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids).detach())
+            if use_batch:
+                logp_old = self._compute_logp_batch(encoded, encoded_len, hyp_token_ids_list).detach()
+            else:
+                logp_old_list: List[torch.Tensor] = []
+                for token_ids in hyp_token_ids_list:
+                    logp_old_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids).detach())
+                logp_old = torch.stack(logp_old_list, dim=0)
         if compute_timings:
             if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
                 torch.cuda.synchronize(signal.device)
             timings["logp_old_ms"] = (time.perf_counter() - t2) * 1000.0
 
         t3 = time.perf_counter()
-        for token_ids in hyp_token_ids_list:
-            logp_new_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids))
+        if use_batch:
+            logp_new = self._compute_logp_batch(encoded, encoded_len, hyp_token_ids_list)
+        else:
+            logp_new_list: List[torch.Tensor] = []
+            for token_ids in hyp_token_ids_list:
+                logp_new_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids))
+            logp_new = torch.stack(logp_new_list, dim=0)
         if compute_timings:
             if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
                 torch.cuda.synchronize(signal.device)
             timings["logp_new_ms"] = (time.perf_counter() - t3) * 1000.0
 
-        logp_old = torch.stack(logp_old_list, dim=0)
-        logp_new = torch.stack(logp_new_list, dim=0)
         logp_old_detached = logp_old.detach()
         logp_new_detached = logp_new.detach()
 
@@ -827,7 +977,10 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         logp_old_f = logp_old_detached.to(dtype=torch.float32)
         logp_new_f = logp_new_detached.to(dtype=torch.float32)
-        log_ratio = (logp_new_f - logp_old_f).clamp(min=-80.0, max=80.0)
+        delta_raw = logp_new_f - logp_old_f
+        delta_clamp_min, delta_clamp_max = -80.0, 80.0
+        clamp_hit = ((delta_raw < delta_clamp_min) | (delta_raw > delta_clamp_max)).to(torch.float32).mean()
+        log_ratio = delta_raw.clamp(min=delta_clamp_min, max=delta_clamp_max)
         ratio = torch.exp(log_ratio)
         clip_eps = float(self.gspo_cfg.clip_eps)
         metrics["gspo_ratio_mean"] = ratio.mean()
@@ -837,6 +990,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         metrics["gspo_approx_kl"] = (logp_old_f - logp_new_f).mean()
         metrics["gspo_logp_span"] = (logp_old_f.max() - logp_old_f.min())
         metrics["gspo_best_reward_minus_mean"] = (rewards.max() - rewards.mean()).detach()
+        metrics["gspo_log_ratio_raw_max"] = delta_raw.max().detach()
+        metrics["gspo_log_ratio_raw_min"] = delta_raw.min().detach()
+        metrics["gspo_log_ratio_clamp_hit_frac"] = clamp_hit.detach()
 
         if compute_diagnostics:
             metrics.update(self._maybe_validate_fused_logp(encoded=encoded, encoded_len=encoded_len, token_ids=ref_token_ids))
@@ -889,6 +1045,17 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         if wants_validation:
             do_log = True
 
+        # ---- Diagnostics gating under grad accumulation ----
+        # Under grad accumulation, `training_step()` can be called multiple times with the same `global_step`.
+        # We want expensive diagnostics/printing/validation to run at most once per optimizer step.
+        if bool(self.gspo_cfg.get("diagnostics_once_per_global_step", True)):
+            if (do_log or do_print or wants_validation) and (int(self.global_step) == self._gspo_last_diagnostics_global_step):
+                do_log = False
+                do_print = False
+                wants_validation = False
+            elif do_log or do_print or wants_validation:
+                self._gspo_last_diagnostics_global_step = int(self.global_step)
+
         compute_diagnostics = do_log or do_print or wants_validation
 
         compute_timings = compute_diagnostics and bool(self.gspo_cfg.get("log_timings", False))
@@ -909,6 +1076,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         loss = torch.stack(losses).mean()
 
         # Logging.
+        sync_core = bool(self.gspo_cfg.get("sync_dist_core_metrics", True))
+        sync_extra = bool(self.gspo_cfg.get("sync_dist_extra_metrics", True))
+
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
 
         # Always log core "is it updating / is it buggy?" metrics so users don't over-interpret `train_loss≈0`.
@@ -935,17 +1105,20 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             "gspo_ratio_max",
             "gspo_clip_frac",
             "gspo_approx_kl",
+            "gspo_log_ratio_raw_max",
+            "gspo_log_ratio_raw_min",
+            "gspo_log_ratio_clamp_hit_frac",
         }
         for key in sorted(always_log_keys):
             if key in metrics_acc:
-                self.log(f"train_{key}", torch.stack(metrics_acc[key]).mean(), prog_bar=False, sync_dist=True)
+                self.log(f"train_{key}", torch.stack(metrics_acc[key]).mean(), prog_bar=False, sync_dist=sync_core)
 
         if do_log:
             for key, values in metrics_acc.items():
                 if key in always_log_keys:
                     continue
                 # Metrics are per-sample; aggregate across batch to one scalar.
-                self.log(f"train_{key}", torch.stack(values).mean(), prog_bar=False, sync_dist=True)
+                self.log(f"train_{key}", torch.stack(values).mean(), prog_bar=False, sync_dist=sync_extra)
 
         # Optional: compact text logs for quick debugging (global rank 0 only).
         if do_print and getattr(self.trainer, "is_global_zero", True):
@@ -981,7 +1154,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
                 return torch.zeros((), device=next(self.parameters()).device, dtype=torch.float32)
             return torch.sqrt(sum(g.detach().float().pow(2).sum() for g in grads))
 
-        self.log("train_gspo_grad_norm_decoder", _module_grad_norm(self.decoder), prog_bar=False, sync_dist=True)
-        self.log("train_gspo_grad_norm_joint", _module_grad_norm(self.joint), prog_bar=False, sync_dist=True)
+        sync_extra = bool(self.gspo_cfg.get("sync_dist_extra_metrics", True))
+        self.log("train_gspo_grad_norm_decoder", _module_grad_norm(self.decoder), prog_bar=False, sync_dist=sync_extra)
+        self.log("train_gspo_grad_norm_joint", _module_grad_norm(self.joint), prog_bar=False, sync_dist=sync_extra)
         if self._train_encoder:
-            self.log("train_gspo_grad_norm_encoder", _module_grad_norm(self.encoder), prog_bar=False, sync_dist=True)
+            self.log("train_gspo_grad_norm_encoder", _module_grad_norm(self.encoder), prog_bar=False, sync_dist=sync_extra)
