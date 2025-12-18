@@ -84,6 +84,11 @@ class GSPOConfig:
     freeze_encoder: bool = True
     encoder_no_grad: bool = True
 
+    # Safety: Lightning may call `model.train()` and re-enable `.training=True` on all submodules,
+    # even if they are frozen (`requires_grad=False`). This can re-enable dropout in the encoder,
+    # causing non-deterministic rollouts / logp and destabilizing GSPO.
+    enforce_eval_on_frozen_modules: bool = True
+
     # Disable dropout for rollout + logp computations.
     disable_decoder_dropout: bool = True
     disable_joint_dropout: bool = True
@@ -368,6 +373,12 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         Lightning will set the full model to train() for you. We selectively set
         submodules back to eval() each step.
         """
+        if self.gspo_cfg.get("enforce_eval_on_frozen_modules", True):
+            if self.gspo_cfg.get("freeze_preprocessor", True):
+                self.preprocessor.eval()
+            if self.gspo_cfg.get("freeze_encoder", True):
+                self.encoder.eval()
+
         if self.gspo_cfg.get("disable_decoder_dropout", True):
             self.decoder.eval()
         if self.gspo_cfg.get("disable_joint_dropout", True):

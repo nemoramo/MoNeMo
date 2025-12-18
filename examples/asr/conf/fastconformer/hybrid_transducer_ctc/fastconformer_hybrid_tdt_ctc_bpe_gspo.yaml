@@ -38,6 +38,7 @@ model:
     freeze_preprocessor: true
     freeze_encoder: true
     encoder_no_grad: true
+    enforce_eval_on_frozen_modules: true
 
     # Stability: disable dropout during rollout/logp computations.
     disable_decoder_dropout: true
