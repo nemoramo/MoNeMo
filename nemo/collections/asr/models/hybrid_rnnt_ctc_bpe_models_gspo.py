@@ -45,6 +45,7 @@ TODO roadmap (future work):
 from __future__ import annotations
 
 import copy
+import time
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
@@ -107,6 +108,21 @@ class GSPOConfig:
     disable_decoder_dropout: bool = True
     disable_joint_dropout: bool = True
 
+    # Diagnostics / logging.
+    # When enabled, logs PPO-style stats (ratio, clip fraction, approx KL) as "canaries" for silent bugs.
+    log_diagnostics: bool = True
+    # Reduce logging overhead by emitting diagnostics every N optimizer steps.
+    log_diagnostics_every_n_steps: int = 50
+    # Additionally print a compact diagnostics line to the Python logger every N optimizer steps (0 disables).
+    log_text_every_n_steps: int = 0
+    # Optional: record coarse-grained encode/decode/logp timings (adds small CPU overhead).
+    log_timings: bool = False
+    # If True and running on CUDA, synchronize around timed blocks for more accurate timings (slower).
+    timing_sync_cuda: bool = False
+    # Optional: log gradient norms of decoder/joint (and encoder if trained).
+    log_grad_norm: bool = False
+    grad_norm_every_n_steps: int = 50
+
 
 def _as_tensor_cfg(cfg: Optional[DictConfig], schema: GSPOConfig) -> DictConfig:
     if cfg is None:
@@ -127,6 +143,21 @@ def _group_normalize(rewards: torch.Tensor, eps: float) -> torch.Tensor:
     mean = rewards.mean()
     std = rewards.std(unbiased=False)
     return (rewards - mean) / (std + eps)
+
+
+def _safe_corrcoef(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch.Tensor:
+    """
+    Small-sample safe Pearson correlation coefficient for diagnostics.
+
+    Returns 0 if either vector has near-zero variance.
+    """
+    if x.numel() < 2 or y.numel() < 2:
+        return torch.zeros((), device=x.device, dtype=torch.float32)
+
+    x = x.float() - x.float().mean()
+    y = y.float() - y.float().mean()
+    denom = x.std(unbiased=False) * y.std(unbiased=False)
+    return (x * y).mean() / (denom + eps)
 
 
 def gspo_clipped_loss_seq(
@@ -426,7 +457,13 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         return float(self._reward_fn(hyp_text=hyp_text, ref_text=ref_text))
 
     def _gspo_one_sample(
-        self, signal: torch.Tensor, signal_len: torch.Tensor, transcript: torch.Tensor, transcript_len: torch.Tensor
+        self,
+        signal: torch.Tensor,
+        signal_len: torch.Tensor,
+        transcript: torch.Tensor,
+        transcript_len: torch.Tensor,
+        compute_diagnostics: bool,
+        compute_timings: bool,
     ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
         """
         GSPO objective for a single sample (batch size 1).
@@ -436,15 +473,27 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         ref_token_ids = transcript[0, : int(transcript_len.item())].tolist()
         ref_text = self._tokens_to_text(ref_token_ids)
 
+        timings: Dict[str, float] = {}
+        t0 = time.perf_counter()
+
         # 1) Encode once.
         encoded, encoded_len = self._encode_one(signal, signal_len)
         # Detach encoder outputs if encoder is not being trained (saves memory and avoids accidental grads).
         if not self._train_encoder:
             encoded = encoded.detach()
+        if compute_timings:
+            if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
+                torch.cuda.synchronize(signal.device)
+            timings["encode_ms"] = (time.perf_counter() - t0) * 1000.0
 
         # 2) Rollout: beam decode n-best hypotheses from cached encoder outputs.
+        t1 = time.perf_counter()
         with torch.no_grad():
             hyps_batch = self.decoding.rnnt_decoder_predictions_tensor(encoded, encoded_len, return_hypotheses=True)
+        if compute_timings:
+            if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
+                torch.cuda.synchronize(signal.device)
+            timings["decode_ms"] = (time.perf_counter() - t1) * 1000.0
 
         # `rnnt_decoder_predictions_tensor()` returns:
         # - List[List[Hypothesis]] for n-best (beam, return_best_hypothesis=False)
@@ -486,12 +535,22 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         logp_old_list: List[torch.Tensor] = []
         logp_new_list: List[torch.Tensor] = []
 
+        t2 = time.perf_counter()
         with torch.no_grad():
             for token_ids in hyp_token_ids_list:
                 logp_old_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids).detach())
+        if compute_timings:
+            if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
+                torch.cuda.synchronize(signal.device)
+            timings["logp_old_ms"] = (time.perf_counter() - t2) * 1000.0
 
+        t3 = time.perf_counter()
         for token_ids in hyp_token_ids_list:
             logp_new_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids))
+        if compute_timings:
+            if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
+                torch.cuda.synchronize(signal.device)
+            timings["logp_new_ms"] = (time.perf_counter() - t3) * 1000.0
 
         logp_old = torch.stack(logp_old_list, dim=0)
         logp_new = torch.stack(logp_new_list, dim=0)
@@ -511,11 +570,52 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             sft_loss = -gt_logp  # minimize NLL
             total_loss = total_loss + sft_weight * sft_loss
 
-        metrics: Dict[str, torch.Tensor] = {
-            "gspo_rl_loss": rl_loss.detach(),
-            "gspo_reward_mean": rewards.mean().detach(),
-            "gspo_reward_std": rewards.std(unbiased=False).detach(),
-        }
+        metrics: Dict[str, torch.Tensor] = {}
+
+        # Always log core scalars.
+        metrics["gspo_rl_loss"] = rl_loss.detach()
+        metrics["gspo_reward_mean"] = rewards.mean().detach()
+        metrics["gspo_reward_std"] = rewards.std(unbiased=False).detach()
+
+        if compute_diagnostics:
+            adv_detached = advantages.detach()
+            metrics["gspo_adv_mean"] = adv_detached.mean()
+            metrics["gspo_adv_std"] = adv_detached.std(unbiased=False)
+            metrics["gspo_adv_min"] = adv_detached.min()
+            metrics["gspo_adv_max"] = adv_detached.max()
+
+            # PPO-style canaries for silent bugs (even if you expect them ~0 in on-policy single-step mode).
+            # NOTE: Clamp log-ratio before exp to avoid inf in diagnostics.
+            log_ratio = (logp_new.detach() - logp_old.detach()).clamp(min=-20.0, max=20.0)
+            ratio = torch.exp(log_ratio)
+            clip_eps = float(self.gspo_cfg.clip_eps)
+            metrics["gspo_ratio_mean"] = ratio.mean()
+            metrics["gspo_ratio_std"] = ratio.std(unbiased=False)
+            metrics["gspo_clip_frac"] = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
+            metrics["gspo_approx_kl"] = (logp_old.detach() - logp_new.detach()).mean()
+
+            # N-best group diagnostics.
+            k = max(1, len(hyp_texts))
+            uniq = len(set(hyp_texts))
+            uniq_frac = float(uniq) / float(k)
+            metrics["gspo_uniq_hyp_frac"] = torch.tensor(uniq_frac, device=device, dtype=torch.float32)
+            metrics["gspo_dup_frac"] = torch.tensor(1.0 - uniq_frac, device=device, dtype=torch.float32)
+            metrics["gspo_best_reward_minus_mean"] = (rewards.max() - rewards.mean()).detach()
+
+            hyp_lens = torch.tensor([len(ids) for ids in hyp_token_ids_list], device=device, dtype=torch.float32)
+            metrics["gspo_hyp_len_mean"] = hyp_lens.mean()
+            metrics["gspo_hyp_len_std"] = hyp_lens.std(unbiased=False)
+            metrics["gspo_hyp_len_min"] = hyp_lens.min()
+            metrics["gspo_hyp_len_max"] = hyp_lens.max()
+
+            metrics["gspo_corr_reward_hyp_len"] = _safe_corrcoef(rewards, hyp_lens)
+            metrics["gspo_corr_adv_hyp_len"] = _safe_corrcoef(adv_detached, hyp_lens)
+            metrics["gspo_corr_reward_logp_old"] = _safe_corrcoef(rewards, logp_old.detach())
+
+            if compute_timings:
+                for name, value in timings.items():
+                    metrics[f"gspo_time_{name}"] = torch.tensor(value, device=device, dtype=torch.float32)
+
         if sft_loss is not None:
             metrics["gspo_sft_loss"] = sft_loss.detach()
 
@@ -534,22 +634,77 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         # Memory-first implementation assumes small batches and loops over samples.
         batch_size = int(signal.shape[0])
         losses: List[torch.Tensor] = []
-        reward_means: List[torch.Tensor] = []
-        reward_stds: List[torch.Tensor] = []
+        metrics_acc: Dict[str, List[torch.Tensor]] = {}
+
+        log_diagnostics = bool(self.gspo_cfg.get("log_diagnostics", True))
+        diag_every = int(self.gspo_cfg.get("log_diagnostics_every_n_steps", 50))
+        log_text_every = int(self.gspo_cfg.get("log_text_every_n_steps", 0))
+
+        do_log = log_diagnostics and (diag_every <= 1 or (self.global_step % diag_every == 0))
+        do_print = log_text_every > 0 and (self.global_step % log_text_every == 0)
+        compute_diagnostics = do_log or do_print
+
+        compute_timings = compute_diagnostics and bool(self.gspo_cfg.get("log_timings", False))
 
         for i in range(batch_size):
             loss_i, metrics_i = self._gspo_one_sample(
-                signal[i : i + 1], signal_len[i : i + 1], transcript[i : i + 1], transcript_len[i : i + 1]
+                signal[i : i + 1],
+                signal_len[i : i + 1],
+                transcript[i : i + 1],
+                transcript_len[i : i + 1],
+                compute_diagnostics=compute_diagnostics,
+                compute_timings=compute_timings,
             )
             losses.append(loss_i)
-            reward_means.append(metrics_i["gspo_reward_mean"])
-            reward_stds.append(metrics_i["gspo_reward_std"])
+            for key, value in metrics_i.items():
+                metrics_acc.setdefault(key, []).append(value)
 
         loss = torch.stack(losses).mean()
 
-        # Logging (cheap scalars only).
+        # Logging.
         self.log("train_loss", loss, prog_bar=True, sync_dist=True)
-        self.log("train_gspo_reward_mean", torch.stack(reward_means).mean(), prog_bar=False, sync_dist=True)
-        self.log("train_gspo_reward_std", torch.stack(reward_stds).mean(), prog_bar=False, sync_dist=True)
+        if do_log:
+            for key, values in metrics_acc.items():
+                # Metrics are per-sample; aggregate across batch to one scalar.
+                self.log(f"train_{key}", torch.stack(values).mean(), prog_bar=False, sync_dist=True)
+
+        # Optional: compact text logs for quick debugging (global rank 0 only).
+        if do_print and getattr(self.trainer, "is_global_zero", True):
+            from nemo.utils import logging
+
+            msg = (
+                f"GSPO step={int(self.global_step)} "
+                f"loss={loss.detach().float().item():.4f} "
+                f"reward_mean={torch.stack(metrics_acc['gspo_reward_mean']).mean().item():.4f} "
+                f"reward_std={torch.stack(metrics_acc['gspo_reward_std']).mean().item():.4f}"
+            )
+            if "gspo_ratio_mean" in metrics_acc:
+                msg += (
+                    f" ratio_mean={torch.stack(metrics_acc['gspo_ratio_mean']).mean().item():.4f} "
+                    f"clip_frac={torch.stack(metrics_acc['gspo_clip_frac']).mean().item():.4f} "
+                    f"approx_kl={torch.stack(metrics_acc['gspo_approx_kl']).mean().item():.4f}"
+                )
+            if "gspo_dup_frac" in metrics_acc:
+                msg += f" dup_frac={torch.stack(metrics_acc['gspo_dup_frac']).mean().item():.4f}"
+            logging.info(msg)
 
         return loss
+
+    def on_before_optimizer_step(self, optimizer) -> None:
+        if not bool(self.gspo_cfg.get("log_grad_norm", False)):
+            return
+
+        every = int(self.gspo_cfg.get("grad_norm_every_n_steps", 50))
+        if every > 1 and (self.global_step % every != 0):
+            return
+
+        def _module_grad_norm(module: torch.nn.Module) -> torch.Tensor:
+            grads = [p.grad for p in module.parameters() if p.grad is not None]
+            if not grads:
+                return torch.zeros((), device=next(self.parameters()).device, dtype=torch.float32)
+            return torch.sqrt(sum(g.detach().float().pow(2).sum() for g in grads))
+
+        self.log("train_gspo_grad_norm_decoder", _module_grad_norm(self.decoder), prog_bar=False, sync_dist=True)
+        self.log("train_gspo_grad_norm_joint", _module_grad_norm(self.joint), prog_bar=False, sync_dist=True)
+        if self._train_encoder:
+            self.log("train_gspo_grad_norm_encoder", _module_grad_norm(self.encoder), prog_bar=False, sync_dist=True)

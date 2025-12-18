@@ -44,6 +44,18 @@ model:
     disable_decoder_dropout: true
     disable_joint_dropout: true
 
+    # Diagnostics (TensorBoard + optional text logs).
+    # These are "canaries" to catch silent bugs (dropout on, logp mismatch, etc).
+    log_diagnostics: true
+    log_diagnostics_every_n_steps: 50
+    log_text_every_n_steps: 50
+    # Optional (slower): record coarse encode/decode/logp timings.
+    # log_timings: true
+    # timing_sync_cuda: false
+    # Optional: log gradient norms.
+    # log_grad_norm: true
+    # grad_norm_every_n_steps: 50
+
     # Alternative: allow encoder fine-tuning (higher memory).
     # freeze_encoder: false
     # encoder_no_grad: false
