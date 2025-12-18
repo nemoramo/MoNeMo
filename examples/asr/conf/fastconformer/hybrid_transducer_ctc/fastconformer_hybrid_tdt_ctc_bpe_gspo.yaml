@@ -34,7 +34,7 @@ model:
     advantage_eps: 1e-8
     sft_weight: 0.05
 
-    # Memory-first defaults.
+    # Memory-first defaults (slow but small).
     freeze_preprocessor: true
     freeze_encoder: true
     encoder_no_grad: true
@@ -43,6 +43,47 @@ model:
     # Stability: disable dropout during rollout/logp computations.
     disable_decoder_dropout: true
     disable_joint_dropout: true
+
+    # Alternative: allow encoder fine-tuning (higher memory).
+    # freeze_encoder: false
+    # encoder_no_grad: false
+
+    # TODO (future): make the objective closer to "true PPO/GSPO" semantics.
+    # Current implementation computes logp_old/logp_new within the same training_step()
+    # and behaves like an on-policy sequence-level policy-gradient / MWER-style objective.
+    #
+    # Future options (not implemented yet; shown here as a roadmap):
+    # - PPO epochs (sample reuse): rollout once, cache logp_old, do multiple updates by recomputing logp_new.
+    # - Old-policy snapshot: maintain a lagged copy of decoder/joint as pi_old (sync every N steps).
+    # - KL regularization: add optional KL-to-reference to control drift.
+    #
+    # ppo_epochs: 4
+    # old_policy_sync_interval: 500
+    # kl_beta: 0.01
+
+    # Reward examples:
+    # - Add CER alongside WER:
+    # reward:
+    #   components:
+    #     - name: wer
+    #       weight: 1.0
+    #       one_minus_error: true
+    #     - name: cer
+    #       weight: 0.2
+    #       one_minus_error: true
+    #
+    # - Use Hydra instantiate for custom rewards (implement your own TextRewardComponent):
+    # reward:
+    #   _target_: nemo.collections.asr.parts.rl.rewards.WeightedSumTextReward
+    #   components:
+    #     - _target_: nemo.collections.asr.parts.rl.rewards.TextErrorRateReward
+    #       name: wer
+    #       weight: 1.0
+    #       use_cer: false
+    #       one_minus_error: true
+    #     - _target_: your_pkg.your_module.YourCustomReward
+    #       weight: 0.05
+    #       ...: ...
 
   # GSPO requires n-best hypotheses (beam + return_best_hypothesis=False).
   decoding:

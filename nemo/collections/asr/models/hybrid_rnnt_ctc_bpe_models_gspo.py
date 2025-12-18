@@ -21,15 +21,25 @@ This module is intentionally written to be "slow but small":
 - Generate a small n-best group using built-in RNNT/TDT beam decoding.
 - Compute sequence-level logp via TDT NLL (marginal over alignments).
 
+Important note (PPO semantics):
+- Standard PPO uses samples from a behavior policy `pi_old` and optimizes a (potentially updated) current policy `pi_new`.
+- This implementation is intentionally minimal and computes `logp_old` and `logp_new` using the same parameters within
+  a single `training_step()`. As a result, the importance ratio is typically ~1 and the clipped objective behaves like a
+  sequence-level on-policy policy gradient / MWER-style risk minimization objective, wrapped in a PPO-shaped loss.
+- The PPO/GSPO "shell" is kept to make it easy to extend toward stricter PPO semantics later (see TODO roadmap below).
+
 References (high level):
 - PPO (clipped policy gradient): https://arxiv.org/abs/1707.06347
 - TDT (Token-and-Duration Transducer): https://arxiv.org/abs/2304.06795
 - GSPO / sequence-level importance ratios discussion: https://arxiv.org/pdf/2507.18071
 
-TODO:
-- Add optional LM reward shaping (KenLM / neural rescoring).
-- Add an optional frozen reference model for KL regularization.
-- Consider length-normalized rewards / penalties to mitigate short-hypothesis bias.
+TODO roadmap (future work):
+- True PPO-style sample reuse (PPO epochs): rollout once, cache `logp_old`, do multiple optimizer steps by recomputing
+  `logp_new` against the cached group. Add PPO diagnostics (clip fraction, approx KL, ratio stats).
+- Old-policy snapshot: maintain a lagged copy of decoder/joint as `pi_old` (sync every N steps), use it for rollout and
+  `logp_old` while optimizing the current policy. Prefer copying decoder/joint only (keep encoder frozen) for memory.
+- KL regularization: add optional KL-to-reference (either snapshot or a separate frozen reference) to control drift.
+- Reward shaping: add optional LM score / length normalization / other verifiable rewards via the unified reward interface.
 """
 
 from __future__ import annotations

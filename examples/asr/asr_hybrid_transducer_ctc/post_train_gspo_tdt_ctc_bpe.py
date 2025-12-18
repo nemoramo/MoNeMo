@@ -20,6 +20,12 @@ This script runs a sequence-level PPO-style objective (GSPO) using:
 - sequence logp(y|x) from the transducer loss (TDT) as a proxy for log-likelihood
 - WER/CER reward computed from decoded text
 
+Important note (PPO semantics):
+- Standard PPO uses samples from a behavior policy `pi_old` and optimizes an updated policy `pi_new`.
+- This example is intentionally minimal and computes `logp_old` and `logp_new` from the same parameters within one
+  `training_step()`. In practice this behaves like a sequence-level on-policy policy gradient / MWER-style objective,
+  wrapped in a PPO-shaped loss. The code is structured to support stricter PPO semantics later.
+
 Config:
 - `examples/asr/conf/fastconformer/hybrid_transducer_ctc/fastconformer_hybrid_tdt_ctc_bpe_gspo.yaml`
 
@@ -31,6 +37,7 @@ References:
 TODO:
 - Add LM reward shaping / reranking (KenLM) for length bias mitigation.
 - Add a frozen reference model for KL regularization (optional).
+- Add PPO epochs (sample reuse) and/or an old-policy snapshot to make importance ratios/clipping meaningful.
 """
 
 import lightning.pytorch as pl
@@ -67,4 +74,3 @@ def main(cfg):
 
 if __name__ == "__main__":
     main()  # noqa pylint: disable=no-value-for-parameter
-

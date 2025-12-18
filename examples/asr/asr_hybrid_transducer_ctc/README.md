@@ -41,6 +41,13 @@ This repo also includes a minimal, memory-first GSPO post-training example for H
 The implementation is intentionally "slow but small" (freeze encoder + `batch_size=1` + grad accumulation) and uses
 n-best beam hypotheses plus sequence-level importance ratios.
 
+Important note (PPO semantics):
+- Standard PPO distinguishes `pi_old` (behavior policy that generated samples) from `pi_new` (current policy being optimized).
+- This example currently computes `logp_old` and `logp_new` from the same parameters within a single `training_step()`.
+  In practice, the importance ratio is ~1 and the update behaves like a sequence-level on-policy policy gradient /
+  MWER-style risk minimization objective, wrapped in a PPO-shaped loss.
+- The code/config are structured so we can extend toward stricter PPO/GSPO later (PPO epochs / old-policy snapshot / KL).
+
 References:
 - PPO (clipped objective): https://arxiv.org/abs/1707.06347
 - TDT (Token-and-Duration Transducer): https://arxiv.org/abs/2304.06795
