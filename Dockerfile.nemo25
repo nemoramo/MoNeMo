@@ -1,10 +1,18 @@
 FROM nvcr.io/nvidia/nemo:25.11
 SHELL ["/bin/bash", "-lc"]
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends ffmpeg && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY docker-compose-related/setup_ramosnemo.sh /opt/setup_ramosnemo.sh
+RUN chmod +x /opt/setup_ramosnemo.sh
+
 WORKDIR /workspace/RamosNeMo
 COPY . .
 RUN pip install --upgrade pip setuptools wheel && \
     pip install -e ".[asr,audio]"
 ENV NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=1
 ENV NUMBA_CUDA_USE_NVIDIA_BINDINGS=1
-ENV LD_PRELOAD=/opt/venv/lib/libittnotify.so
-ENTRYPOINT ["/bin/bash"]
+CMD ["/bin/bash"]
