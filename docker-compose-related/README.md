@@ -7,6 +7,8 @@ docker compose -f docker-compose.yml build nemo-training
 docker compose -f docker-compose.yml up -d nemo-training
 ```
 
+说明：`docker-compose.yml` 默认使用仓库根目录的 `Dockerfile.nemo25` 构建镜像。
+
 进入容器：
 ```bash
 docker compose -f docker-compose.yml exec -it nemo-training bash
@@ -35,4 +37,4 @@ python /opt/ramosnemo_source/entrance_kit/local/entrance.py \
 
 ## 挂载与依赖
 - `/data1`, `/data2` 挂载到容器内同路径；`../RamosNeMo` 挂载到 `/opt/ramosnemo_source`。  
-- Dockerfile 已安装 `ffmpeg`，启动时 `/opt/setup_ramosnemo.sh` 会 `pip install -e /opt/ramosnemo_source`。 
+- `Dockerfile.nemo25` 已安装 `ffmpeg`；启动时 `/opt/setup_ramosnemo.sh` 默认会执行 `pip install -e "/opt/ramosnemo_source[asr,audio]"`（可用 `RAMOSNEMO_EXTRAS=none` 关闭 extras）。 
