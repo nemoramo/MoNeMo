@@ -637,11 +637,11 @@ if USE_POLARS:
         print("[WARN] USE_POLARS=1 ignored because USE_LHOTSE=1")
     else:
         args += [
-            "model.train_ds.use_polars=true",
-            "model.validation_ds.use_polars=true",
+            "++model.train_ds.use_polars=true",
+            "++model.validation_ds.use_polars=true",
         ]
         if test_manifest_path:
-            args += ["+model.test_ds.use_polars=true"]
+            args += ["++model.test_ds.use_polars=true"]
 
 # Pretokenize 开关（仅在非 Lhotse 时有意义）
 if not PRETOKENIZE:
@@ -649,11 +649,11 @@ if not PRETOKENIZE:
         print("[WARN] PRETOKENIZE=0 ignored because USE_LHOTSE=1")
     else:
         args += [
-            "model.train_ds.pretokenize=false",
-            "model.validation_ds.pretokenize=false",
+            "++model.train_ds.pretokenize=false",
+            "++model.validation_ds.pretokenize=false",
         ]
         if test_manifest_path:
-            args += ["+model.test_ds.pretokenize=false"]
+            args += ["++model.test_ds.pretokenize=false"]
 
 # batch 大小
 if train_bs_override is not None:
@@ -672,16 +672,16 @@ if test_manifest_path:
     tb = TEST_BATCH.strip()
     test_bs = int(tb) if tb else 16
     args += [
-        f"+model.test_ds.manifest_filepath={test_manifest_path}",
-        "+model.test_ds.shuffle=false",
-        f"+model.test_ds.batch_size={test_bs}",
-        f"+model.test_ds.num_workers={TEST_NUM_WORKERS}",
-        "+model.test_ds.pin_memory=true",
+        f"++model.test_ds.manifest_filepath={test_manifest_path}",
+        "++model.test_ds.shuffle=false",
+        f"++model.test_ds.batch_size={test_bs}",
+        f"++model.test_ds.num_workers={TEST_NUM_WORKERS}",
+        "++model.test_ds.pin_memory=true",
     ]
     if USE_LHOTSE:
-        args += ["+model.test_ds.use_lhotse=true"]
+        args += ["++model.test_ds.use_lhotse=true"]
     elif USE_POLARS:
-        args += ["+model.test_ds.use_lhotse=false"]
+        args += ["++model.test_ds.use_lhotse=false"]
 
 # Lhotse 动态 batch duration 覆写
 if BATCH_DURATION_TRAIN.strip():
@@ -689,7 +689,7 @@ if BATCH_DURATION_TRAIN.strip():
 if BATCH_DURATION_VAL.strip():
     args += [f"model.validation_ds.batch_duration={BATCH_DURATION_VAL.strip()}"]
 if test_manifest_path and BATCH_DURATION_TEST.strip():
-    args += [f"+model.test_ds.batch_duration={BATCH_DURATION_TEST.strip()}"]
+    args += [f"++model.test_ds.batch_duration={BATCH_DURATION_TEST.strip()}"]
 
 # 时长裁剪
 if MAX_DURATION_TRAIN.strip():

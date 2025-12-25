@@ -12,7 +12,11 @@ RUN chmod +x /opt/setup_ramosnemo.sh
 WORKDIR /workspace/RamosNeMo
 COPY . .
 RUN pip install --upgrade pip setuptools wheel && \
+    pip install --no-cache-dir pynvjitlink-cu12==0.7.0 'polars>=1.6.0' && \
     pip install -e ".[asr,audio]"
-ENV NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=1
+# numba-cuda: CUDA>=12 已不支持 MVCLinker（会直接 raise），默认禁用 MVC；pynvjitlink 已安装，必要时可手动开启
+ENV NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=0
+# 说明：在 H20 + CUDA forward-compat（容器里显示 CUDA 13.0）场景下，开启 pynvjitlink 可能触发 PTX 版本不匹配；默认关闭更稳。
+ENV NUMBA_CUDA_ENABLE_PYNVJITLINK=0
 ENV NUMBA_CUDA_USE_NVIDIA_BINDINGS=1
 CMD ["/bin/bash"]
