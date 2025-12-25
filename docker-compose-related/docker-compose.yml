@@ -6,6 +6,9 @@ services:
     image: nemo-25.11-custom:latest
     runtime: nvidia
     ipc: host
+    ulimits:
+      memlock: -1
+      stack: 67108864
     stdin_open: true
     tty: true
     volumes:

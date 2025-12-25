@@ -62,6 +62,21 @@ def parse_args():
     return p.parse_args()
 
 
+def _configure_numba_cuda_linker_env(env: dict) -> None:
+    """
+    Keep NeMo/Numba RNNT(TDT) kernels working on CUDA>=12.
+
+    numba-cuda 在 driver>=12 时已不支持 MVCLinker（NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=1 会直接报错）。
+    本地在 H20 + CUDA forward-compat 场景下，开启 pynvjitlink 可能触发 PTX 版本不匹配；默认关闭更稳。
+    如需启用，可自行设置 NUMBA_CUDA_ENABLE_PYNVJITLINK=1。
+    """
+
+    env["NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY"] = "0"
+
+    if "NUMBA_CUDA_ENABLE_PYNVJITLINK" not in env and "CUDA_ENABLE_PYNVJITLINK" not in env:
+        env["NUMBA_CUDA_ENABLE_PYNVJITLINK"] = "0"
+
+
 def main():
     args = parse_args()
 
@@ -160,6 +175,8 @@ def main():
             "REGION": "",
         }
     )
+
+    _configure_numba_cuda_linker_env(env)
 
     cmd = [sys.executable, str(sm_entry)]
     print("Launching:", " ".join(cmd))

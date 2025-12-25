@@ -38,3 +38,21 @@ python /opt/ramosnemo_source/entrance_kit/local/entrance.py \
 ## 挂载与依赖
 - `/data1`, `/data2` 挂载到容器内同路径；`../RamosNeMo` 挂载到 `/opt/ramosnemo_source`。  
 - `Dockerfile.nemo25` 已安装 `ffmpeg`；启动时 `/opt/setup_ramosnemo.sh` 默认会执行 `pip install -e "/opt/ramosnemo_source[asr,audio]"`（可用 `RAMOSNEMO_EXTRAS=none` 关闭 extras）。 
+
+## numba / pynvjitlink（RNNT/TDT 必需）
+在 CUDA>=12 环境下，`numba-cuda` 的 MVCLinker（`NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=1`）会直接报错：`Use CUDA_ENABLE_PYNVJITLINK for CUDA >= 12.0 MVC`。  
+本仓库的 `Dockerfile.nemo25` 已默认安装 `pynvjitlink-cu12` 并设置：
+- `NUMBA_CUDA_ENABLE_MINOR_VERSION_COMPATIBILITY=0`
+- `NUMBA_CUDA_ENABLE_PYNVJITLINK=0`（默认更稳）
+
+若你修改过镜像或环境变量导致再次报错，重新构建镜像即可：
+```bash
+cd RamosNeMo/docker-compose-related
+docker compose -f docker-compose.yml build --no-cache nemo-training
+```
+
+如需尝试开启 `pynvjitlink`（可能在某些 forward-compat / CUDA 版本组合下触发 PTX 版本不匹配报错），可在启动容器时显式设置：
+```bash
+export NUMBA_CUDA_ENABLE_PYNVJITLINK=1
+docker compose -f docker-compose.yml up -d nemo-training
+```
