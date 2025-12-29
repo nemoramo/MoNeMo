@@ -76,6 +76,8 @@ class TrainKenlmConfig:
     verbose: int = 1  # Verbose level, default is 1.
     save_nemo: bool = False  # Save .nemo checkpoint to use with NGramGPULanguageModel
     normalize_unk_nemo: bool = True  # Normalize the UNK token in the NGramGPULanguageModel model
+    lmplz_temp_prefix: str = ""  # Optional: lmplz -T, e.g. /data2/.../tmp/
+    lmplz_memory: str = ""  # Optional: lmplz -S, e.g. 100G
 
 
 @hydra_runner(config_path=None, config_name='TrainKenlmConfig', schema=TrainKenlmConfig)
@@ -102,9 +104,14 @@ def main(args: TrainKenlmConfig):
         str(args.ngram_length),
         "--arpa",
         arpa_file,
-        discount_arg,
-        "--prune",
-    ] + [str(n) for n in args.ngram_prune]
+    ]
+    if discount_arg:
+        kenlm_args.append(discount_arg)
+    if args.lmplz_temp_prefix:
+        kenlm_args += ["-T", args.lmplz_temp_prefix]
+    if args.lmplz_memory:
+        kenlm_args += ["-S", args.lmplz_memory]
+    kenlm_args += ["--prune"] + [str(n) for n in args.ngram_prune]
 
     if args.cache_path:
         if not os.path.exists(args.cache_path):

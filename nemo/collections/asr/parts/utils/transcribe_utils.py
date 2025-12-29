@@ -307,15 +307,29 @@ def setup_model(cfg: DictConfig, map_location: torch.device) -> Tuple[ASRModel, 
     if ckpt_path is not None and ckpt_path != "None":
         # Infer model class from checkpoint hyperparameters (cfg.target)
         checkpoint = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        hparams = checkpoint.get("hyper_parameters", {}) if isinstance(checkpoint, dict) else {}
-        cfg_in_ckpt = hparams.get("cfg") if isinstance(hparams, dict) else None
-        if not cfg_in_ckpt or "target" not in cfg_in_ckpt:
+        hparams = checkpoint.get("hyper_parameters") if isinstance(checkpoint, dict) else None
+
+        cfg_in_ckpt = None
+        if isinstance(hparams, (dict, DictConfig)):
+            cfg_in_ckpt = hparams.get("cfg")
+
+        classpath = None
+        if isinstance(cfg_in_ckpt, (dict, DictConfig)):
+            classpath = cfg_in_ckpt.get("target")
+        # Some checkpoints may store the model target directly under hyper_parameters
+        if classpath is None and isinstance(hparams, (dict, DictConfig)):
+            classpath = hparams.get("target")
+        # Fallback: infer class from a provided .nemo model archive
+        if classpath is None and getattr(cfg, "model_path", None) not in (None, "None"):
+            model_cfg = ASRModel.restore_from(restore_path=cfg.model_path, return_config=True)
+            classpath = getattr(model_cfg, "target", None)
+
+        if classpath is None:
             raise ValueError(
                 f"Unable to resolve model class from checkpoint: {ckpt_path}. "
-                "Expected 'hyper_parameters.cfg.target' to be present."
+                "Expected 'hyper_parameters.cfg.target' to be present (or provide model_path to infer it)."
             )
 
-        classpath = cfg_in_ckpt["target"]
         imported_class = model_utils.import_class_by_path(classpath)  # type: ASRModel
         logging.info(f"Restoring model from ckpt as : {imported_class.__name__}")
 

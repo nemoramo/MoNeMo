@@ -187,7 +187,9 @@ def main(cfg: EvaluationConfig):
             metrics_to_compute.append("punct_er")
 
         samples_with_metrics = compute_metrics_per_sample(
-            manifest_path=cfg.dataset_manifest,
+            # Use the transcription output manifest (it contains `pred_text`).
+            # If only_score_manifest=True, transcription_cfg.output_filename == cfg.dataset_manifest.
+            manifest_path=transcription_cfg.output_filename,
             reference_field=cfg.gt_text_attr_name,
             hypothesis_field="pred_text",
             metrics=metrics_to_compute,
