@@ -152,6 +152,9 @@ class GSPOConfig:
     # Faster but uses more memory.
     batch_hypotheses: bool = False
 
+    # Diagnostics: validate decoder length semantics in batched logp path.
+    debug_check_batch_lens: bool = True
+
     # Penalty logp for empty hypotheses (e.g. -100.0).
     empty_hyp_logp: float = -100.0
 
@@ -234,7 +237,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
     a memory-first GSPO post-training objective for the RNNT/TDT branch.
     """
 
-    def __init__(self, cfg: DictConfig, trainer: Trainer | None = None):
+    def __init__(self, cfg: DictConfig, trainer: Optional[Trainer] = None):
         super().__init__(cfg=cfg, trainer=trainer)
 
         # Resolve GSPO config.
@@ -620,7 +623,24 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         max_u = max(len(ids) for ids in batch_ids)
         k = len(batch_ids)
 
-        targets = torch.zeros((k, max_u), device=encoded.device, dtype=torch.long)
+        pad_id = 0
+        tokenizer = getattr(self, "tokenizer", None)
+        if tokenizer is not None:
+            for obj in (tokenizer, getattr(tokenizer, "tokenizer", None)):
+                if obj is None:
+                    continue
+                pad_id_value = getattr(obj, "pad_id", None)
+                if pad_id_value is None:
+                    continue
+                try:
+                    pad_id_candidate = int(pad_id_value() if callable(pad_id_value) else pad_id_value)
+                    if pad_id_candidate >= 0:
+                        pad_id = pad_id_candidate
+                        break
+                except Exception:
+                    pass
+
+        targets = torch.full((k, max_u), pad_id, device=encoded.device, dtype=torch.long)
         target_lens = torch.tensor([len(ids) for ids in batch_ids], device=encoded.device, dtype=torch.long)
 
         for i, ids in enumerate(batch_ids):
