@@ -50,7 +50,10 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import torch
-from lightning.pytorch import Trainer
+try:
+    from lightning.pytorch import Trainer
+except ImportError:  # pragma: no cover
+    from pytorch_lightning import Trainer
 from omegaconf import DictConfig, OmegaConf, open_dict
 
 from nemo.collections.asr.losses.rnnt import RNNTLoss
@@ -247,7 +250,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         # Ensure decoding is configured for n-best rollouts (beam + return_best_hypothesis=False).
         self._configure_gspo_decoding()
 
-        # Create a per-sample (reduction=None) transducer NLL module for logp computations.
+        # Create a per-sample (reduction="none") transducer NLL module for logp computations.
         self._gspo_nll = self._build_per_sample_rnnt_loss()
 
         # Reward function (supports weighted sum of multiple components).
@@ -262,11 +265,10 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             _freeze_module(self.encoder)
             self.encoder.eval()
 
-        # Encoder forward should avoid graph creation when the encoder is not being trained.
-        self._train_encoder = not bool(self.gspo_cfg.get("freeze_encoder", False)) and not bool(
-            self.gspo_cfg.get("encoder_no_grad", False)
-        )
-        self._encoder_no_grad = (not self._train_encoder) or bool(self.gspo_cfg.get("encoder_no_grad", False))
+        freeze_encoder = bool(self.gspo_cfg.get("freeze_encoder", False))
+        encoder_no_grad = bool(self.gspo_cfg.get("encoder_no_grad", False))
+        self._encoder_no_grad = freeze_encoder or encoder_no_grad
+        self._train_encoder = not self._encoder_no_grad
         self._gspo_fused_logp_validation_ran = False
         self._gspo_blank_id: Optional[int] = None
         self._gspo_blank_id_source: Optional[str] = None
@@ -321,7 +323,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         if isinstance(reward_cfg, DictConfig) and reward_cfg.get("_target_", None) is not None:
             try:
                 from hydra.utils import instantiate
-            except Exception as e:
+            except ImportError as e:
                 raise RuntimeError("Hydra is required to instantiate `model.gspo.reward` with `_target_`.") from e
             return instantiate(reward_cfg)
 
@@ -383,7 +385,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             num_classes=num_classes,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
-            reduction=None,  # critical for sequence-level logp
+            reduction="none",  # per-sample NLL for sequence-level logp
         )
 
     def _resolve_tokenizer_vocab_size(self) -> Tuple[Optional[int], Optional[str]]:
@@ -536,7 +538,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         if self.joint.fuse_loss_wer:
             # Use fused Joint+Loss path to avoid materializing `joint` outside this scope.
-            # NOTE: We temporarily set the loss reduction to None so that the fused joint returns per-sample NLL.
+            # NOTE: We temporarily set the loss reduction to "none" so that the fused joint returns per-sample NLL.
             # This mutates shared module state, so it must be restored even if an exception is raised.
             joint_loss = getattr(self.joint, "loss", None)
             if joint_loss is None:
@@ -544,7 +546,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
             loss_reduction = joint_loss.reduction
             try:
-                joint_loss.reduction = None
+                joint_loss.reduction = "none"
                 nll, _, _, _ = self.joint(
                     encoder_outputs=encoded,
                     decoder_outputs=dec,
@@ -585,7 +587,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
                 log_probs=joint, targets=targets, input_lengths=encoded_len, target_lengths=target_lens
             )
 
-        # `reduction=None` => Tensor[B]; B==1 here.
+        # `reduction="none"` => Tensor[B]; B==1 here.
         return -nll.squeeze(0)
 
     def _compute_logp_batch(
@@ -676,7 +678,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
             loss_reduction = joint_loss.reduction
             try:
-                joint_loss.reduction = None
+                joint_loss.reduction = "none"
                 nll, _, _, _ = self.joint(
                     encoder_outputs=encoded_batch,
                     decoder_outputs=dec,
@@ -694,7 +696,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
                 log_probs=joint, targets=targets, input_lengths=encoded_len_batch, target_lengths=target_lens
             )
 
-        logp_non_empty = -nll  # `reduction=None` => Tensor[K_non_empty]
+        logp_non_empty = -nll  # `reduction="none"` => Tensor[K_non_empty]
 
         # Reconstruct full K-sized list while preserving gradients for non-empty hypotheses.
         out: List[torch.Tensor] = []
@@ -713,7 +715,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         """
         One-time "hard validation" for fused logp semantics.
 
-        Compares per-sample fused NLL returned by `self.joint(... fuse_loss_wer=True)` (with reduction=None)
+        Compares per-sample fused NLL returned by `self.joint(... fuse_loss_wer=True)` (with reduction="none")
         against a reference computed by explicitly materializing the joint tensor and calling the RNNT/TDT loss.
 
         This is intended to catch silent shape/reduction mismatches in the fused path.
@@ -767,7 +769,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
                     )
                 loss_reduction = joint_loss.reduction
                 try:
-                    joint_loss.reduction = None
+                    joint_loss.reduction = "none"
                     nll_fused, _, _, _ = self.joint(
                         encoder_outputs=encoded,
                         decoder_outputs=dec,
@@ -819,7 +821,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             metrics["gspo_logp_validate_fused_nll"] = nll_fused.mean()
             metrics["gspo_logp_validate_ref_nll"] = nll_ref.mean()
             return metrics
-        except Exception:
+        except Exception as e:
+            logging.warning(f"Fused logp validation failed with an exception: {e}")
             metrics["gspo_logp_validate_skipped"] = torch.tensor(0.0, device=device, dtype=torch.float32)
             metrics["gspo_logp_validate_failed"] = torch.tensor(1.0, device=device, dtype=torch.float32)
             return metrics

@@ -40,7 +40,10 @@ TODO:
 - Add PPO epochs (sample reuse) and/or an old-policy snapshot to make importance ratios/clipping meaningful.
 """
 
-import lightning.pytorch as pl
+try:
+    import lightning.pytorch as pl
+except ImportError:  # pragma: no cover
+    import pytorch_lightning as pl
 from omegaconf import OmegaConf
 
 from nemo.collections.asr.models import EncDecHybridRNNTCTCBPEModelGSPO
@@ -52,7 +55,7 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 
 @hydra_runner(
     config_path="../conf/fastconformer/hybrid_transducer_ctc/",
-    config_name="fastconformer_hybrid_tdt_ctc_bpe_gspo.yaml",
+    config_name="fastconformer_hybrid_tdt_ctc_bpe_gspo",
 )
 def main(cfg):
     logging.info(f'Hydra config:\n{OmegaConf.to_yaml(cfg)}')
