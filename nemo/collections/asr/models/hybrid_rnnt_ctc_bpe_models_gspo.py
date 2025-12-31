@@ -647,6 +647,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             targets[i, : len(ids)] = torch.tensor(ids, device=encoded.device, dtype=torch.long)
 
         # Expand encoder outputs: [1, T, D] -> [K, T, D]
+        # NOTE: `expand()` returns a view (no new memory). If a downstream kernel requires contiguous
+        # inputs, switch to `.expand(...).contiguous()` (higher memory) for compatibility.
         encoded_batch = encoded.expand(k, -1, -1)
         encoded_len_batch = encoded_len.expand(k)
 
@@ -850,6 +852,10 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
     def _ensure_policy_eval_mode(self) -> None:
         """
         Disable dropout for rollout/logp computations for better GSPO stability.
+
+        NOTE: We use `.eval()` as a blunt instrument to disable dropout for determinism. This can also change
+        the behavior of layers with train/eval-specific semantics (e.g., BatchNorm, DropPath/StochasticDepth).
+        Decoder/joint typically do not include these, but if they do, you may need a more targeted strategy.
 
         Lightning will set the full model to train() for you. We selectively set
         submodules back to eval() each step.
