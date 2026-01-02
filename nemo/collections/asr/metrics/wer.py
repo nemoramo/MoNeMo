@@ -335,7 +335,8 @@ class WER(Metric):
         if hypotheses and self.log_prediction:
             logging.info("\n")
             logging.info(f"WER reference:{references[0]}")
-            logging.info(f"WER predicted:{hypotheses[0].text}")
+            hyp0 = hypotheses[0][0] if isinstance(hypotheses[0], list) else hypotheses[0]
+            logging.info(f"WER predicted:{hyp0.text}")
 
         for h, r in zip(hypotheses, references):
             if isinstance(h, list):

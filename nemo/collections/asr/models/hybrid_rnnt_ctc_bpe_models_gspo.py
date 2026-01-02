@@ -196,7 +196,12 @@ def _safe_corrcoef(x: torch.Tensor, y: torch.Tensor, eps: float = 1e-8) -> torch
 
 
 def gspo_clipped_loss_seq(
-    logp_new: torch.Tensor, logp_old: torch.Tensor, advantages: torch.Tensor, clip_eps: float
+    logp_new: torch.Tensor,
+    logp_old: torch.Tensor,
+    advantages: torch.Tensor,
+    clip_eps: float,
+    *,
+    seq_lengths: torch.Tensor,
 ) -> torch.Tensor:
     """
     Sequence-level clipped objective (PPO-style).
@@ -205,9 +210,14 @@ def gspo_clipped_loss_seq(
         logp_new: Tensor[K], requires grad.
         logp_old: Tensor[K], detached baseline.
         advantages: Tensor[K], detached.
+        seq_lengths: Tensor[K], lengths of each sequence (token count, >0).
     Returns:
         Scalar loss (to minimize).
     """
+    # GSPO uses a *length-normalized* sequence probability ratio:
+    #   s_i = (pi_new(y_i|x) / pi_old(y_i|x))^(1/|y_i|)
+    # so we compute exp( (logp_new - logp_old) / |y_i| ).
+    #
     # Numerical stability (bf16/fp16 friendly):
     # - Cast BEFORE subtraction to preserve small deltas (and reduce quantization).
     # - Compute exp in fp32.
@@ -216,7 +226,10 @@ def gspo_clipped_loss_seq(
     logp_old_f = logp_old.to(dtype=torch.float32)
     adv_f = advantages.to(dtype=torch.float32)
 
-    delta = logp_new_f - logp_old_f
+    # Avoid divide-by-zero; empty hypotheses should have been handled earlier.
+    seq_len_f = seq_lengths.to(dtype=torch.float32).clamp(min=1.0)
+
+    delta = (logp_new_f - logp_old_f) / seq_len_f
     delta = delta.clamp(min=-80.0, max=80.0)
 
     ratio = torch.exp(delta)
@@ -388,7 +401,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             num_classes=num_classes,
             loss_name=loss_name,
             loss_kwargs=loss_kwargs,
-            reduction="none",  # per-sample NLL for sequence-level logp
+            reduction=None,  # per-sample NLL for sequence-level logp
         )
 
     def _resolve_tokenizer_vocab_size(self) -> Tuple[Optional[int], Optional[str]]:
@@ -541,7 +554,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         if self.joint.fuse_loss_wer:
             # Use fused Joint+Loss path to avoid materializing `joint` outside this scope.
-            # NOTE: We temporarily set the loss reduction to "none" so that the fused joint returns per-sample NLL.
+            # NOTE: We temporarily set the loss reduction to `None` so that the fused joint returns per-sample NLL.
             # This mutates shared module state, so it must be restored even if an exception is raised.
             joint_loss = getattr(self.joint, "loss", None)
             if joint_loss is None:
@@ -549,7 +562,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
             loss_reduction = joint_loss.reduction
             try:
-                joint_loss.reduction = "none"
+                joint_loss.reduction = None
                 nll, _, _, _ = self.joint(
                     encoder_outputs=encoded,
                     decoder_outputs=dec,
@@ -700,7 +713,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
             loss_reduction = joint_loss.reduction
             try:
-                joint_loss.reduction = "none"
+                joint_loss.reduction = None
                 nll, _, _, _ = self.joint(
                     encoder_outputs=encoded_batch,
                     decoder_outputs=dec,
@@ -791,7 +804,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
                     )
                 loss_reduction = joint_loss.reduction
                 try:
-                    joint_loss.reduction = "none"
+                    joint_loss.reduction = None
                     nll_fused, _, _, _ = self.joint(
                         encoder_outputs=encoded,
                         decoder_outputs=dec,
@@ -892,9 +905,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         GSPO objective for a single sample.
 
         Notes:
-        - This implementation intentionally recomputes `logp_old` and `logp_new` in separate passes even though
-          they are often numerically identical in the current on-policy single-step regime. This redundancy is a
-          useful "canary" to detect unintended stochasticity (e.g., dropout not fully disabled) and logp path drift.
+        - In the current on-policy single-step regime, we use `logp_old = logp_new.detach()` since the rollouts are
+          sampled from the current policy at the start of the step (and `ppo_epochs=1`).
         - `ppo_epochs>1` is not implemented yet (see module docstring TODO roadmap).
         """
         ppo_epochs = int(self.gspo_cfg.get("ppo_epochs", 1))
@@ -949,6 +961,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         # 3) Compute rewards and advantages (tiny tensors).
         hyp_token_ids_list: List[List[int]] = [self._hypothesis_to_token_ids(hyp) for hyp in hyps]
         empty_hyp_count = sum(1 for ids in hyp_token_ids_list if len(ids) == 0)
+        hyp_lens = torch.tensor([max(1, len(ids)) for ids in hyp_token_ids_list], device=device, dtype=torch.long)
 
         # Decode hypothesis text from token ids so reward and logp always correspond to the same sequence.
         hyp_texts: List[str] = [self._tokens_to_text(ids) for ids in hyp_token_ids_list]
@@ -964,24 +977,14 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             advantages = rewards - rewards.mean()
         advantages_detached = advantages.detach()
 
-        # 4) Compute logp_old (no_grad baseline) and logp_new (with grad).
+        # 4) Compute logp_new (with grad) and derive logp_old (detached baseline).
+        #
+        # NOTE: In PPO/GSPO, `logp_old` should come from the behavior policy used to generate the rollouts.
+        # In our "single-step on-policy" Lightning implementation (ppo_epochs=1), the rollouts are generated
+        # from the current parameters at the start of the step, therefore `logp_old` can be taken as a
+        # detached copy of `logp_new`. This avoids subtle train-vs-inference kernel mismatches that can
+        # appear when recomputing `logp_old` under `torch.no_grad()` (e.g., cuDNN RNN inference path).
         use_batch = bool(self.gspo_cfg.get("batch_hypotheses", False))
-
-        t2 = time.perf_counter()
-        with torch.no_grad():
-            if use_batch:
-                logp_old = self._compute_logp_batch(
-                    encoded, encoded_len, hyp_token_ids_list, compute_diagnostics=compute_diagnostics
-                ).detach()
-            else:
-                logp_old_list: List[torch.Tensor] = []
-                for token_ids in hyp_token_ids_list:
-                    logp_old_list.append(self._compute_logp_from_encoder(encoded, encoded_len, token_ids).detach())
-                logp_old = torch.stack(logp_old_list, dim=0)
-        if compute_timings:
-            if bool(self.gspo_cfg.get("timing_sync_cuda", False)) and signal.is_cuda:
-                torch.cuda.synchronize(signal.device)
-            timings["logp_old_ms"] = (time.perf_counter() - t2) * 1000.0
 
         t3 = time.perf_counter()
         if use_batch:
@@ -998,6 +1001,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
                 torch.cuda.synchronize(signal.device)
             timings["logp_new_ms"] = (time.perf_counter() - t3) * 1000.0
 
+        logp_old = logp_new.detach()
+
         logp_old_detached = logp_old.detach()
         logp_new_detached = logp_new.detach()
 
@@ -1006,6 +1011,7 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             logp_old=logp_old,
             advantages=advantages_detached,
             clip_eps=float(self.gspo_cfg.clip_eps),
+            seq_lengths=hyp_lens,
         )
 
         # 5) Optional supervised anchor (ground truth NLL).
@@ -1051,7 +1057,9 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
 
         logp_old_f = logp_old_detached.to(dtype=torch.float32)
         logp_new_f = logp_new_detached.to(dtype=torch.float32)
-        delta_raw = logp_new_f - logp_old_f
+        hyp_lens_f = hyp_lens.to(dtype=torch.float32).clamp(min=1.0)
+
+        delta_raw = (logp_new_f - logp_old_f) / hyp_lens_f
         delta_clamp_min, delta_clamp_max = -80.0, 80.0
         clamp_hit = ((delta_raw < delta_clamp_min) | (delta_raw > delta_clamp_max)).to(torch.float32).mean()
         log_ratio = delta_raw.clamp(min=delta_clamp_min, max=delta_clamp_max)
@@ -1061,8 +1069,8 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
         metrics["gspo_ratio_std"] = ratio.std(unbiased=False)
         metrics["gspo_ratio_max"] = ratio.max()
         metrics["gspo_clip_frac"] = ((ratio < (1.0 - clip_eps)) | (ratio > (1.0 + clip_eps))).float().mean()
-        metrics["gspo_approx_kl"] = (logp_old_f - logp_new_f).mean()
-        metrics["gspo_logp_span"] = (logp_old_f.max() - logp_old_f.min())
+        metrics["gspo_approx_kl"] = ((logp_old_f - logp_new_f) / hyp_lens_f).mean()
+        metrics["gspo_logp_span"] = ((logp_old_f / hyp_lens_f).max() - (logp_old_f / hyp_lens_f).min())
         metrics["gspo_best_reward_minus_mean"] = (rewards.max() - rewards.mean()).detach()
         metrics["gspo_log_ratio_raw_max"] = delta_raw.max().detach()
         metrics["gspo_log_ratio_raw_min"] = delta_raw.min().detach()
@@ -1072,15 +1080,17 @@ class EncDecHybridRNNTCTCBPEModelGSPO(EncDecHybridRNNTCTCBPEModel):
             metrics.update(self._maybe_validate_fused_logp(encoded=encoded, encoded_len=encoded_len, token_ids=ref_token_ids))
 
             # N-best group diagnostics.
-            hyp_lens = torch.tensor([len(ids) for ids in hyp_token_ids_list], device=device, dtype=torch.float32)
-            metrics["gspo_hyp_len_mean"] = hyp_lens.mean()
-            metrics["gspo_hyp_len_std"] = hyp_lens.std(unbiased=False)
-            metrics["gspo_hyp_len_min"] = hyp_lens.min()
-            metrics["gspo_hyp_len_max"] = hyp_lens.max()
+            hyp_lens_diag = hyp_lens.to(dtype=torch.float32)
+            metrics["gspo_hyp_len_mean"] = hyp_lens_diag.mean()
+            metrics["gspo_hyp_len_std"] = hyp_lens_diag.std(unbiased=False)
+            metrics["gspo_hyp_len_min"] = hyp_lens_diag.min()
+            metrics["gspo_hyp_len_max"] = hyp_lens_diag.max()
 
-            metrics["gspo_corr_reward_hyp_len"] = _safe_corrcoef(rewards, hyp_lens)
-            metrics["gspo_corr_adv_hyp_len"] = _safe_corrcoef(advantages_detached, hyp_lens)
-            metrics["gspo_corr_reward_logp_old"] = _safe_corrcoef(rewards, logp_old_detached)
+            metrics["gspo_corr_reward_hyp_len"] = _safe_corrcoef(rewards, hyp_lens_diag)
+            metrics["gspo_corr_adv_hyp_len"] = _safe_corrcoef(advantages_detached, hyp_lens_diag)
+            metrics["gspo_corr_reward_logp_old"] = _safe_corrcoef(
+                rewards, logp_old_detached.to(dtype=torch.float32) / hyp_lens_f
+            )
 
             if compute_timings:
                 for name, value in timings.items():

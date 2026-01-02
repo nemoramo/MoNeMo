@@ -1,0 +1,93 @@
+# GSPO post-training config (memory-first, slow OK) for the 110M FastConformer-Hybrid-TDT-CTC-BPE model.
+#
+# This config composes the standard supervised training config and overrides only the parts
+# needed for GSPO post-training.
+#
+# References:
+# - PPO: https://arxiv.org/abs/1707.06347
+# - TDT: https://arxiv.org/abs/2304.06795
+# - GSPO discussion: https://arxiv.org/pdf/2507.18071
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe_110m
+  - _self_
+
+name: "FastConformer-Hybrid-TDT-CTC-BPE-110M-GSPO"
+
+model:
+  # Optional: disable spec augmentation during post-training for stable reward signal.
+  spec_augment: null
+
+  # GSPO knobs (consumed by EncDecHybridRNNTCTCBPEModelGSPO).
+  gspo:
+    clip_eps: 0.2
+    group_size: 4
+    # Default: verifiable reward = 1 - WER.
+    reward:
+      components:
+        - name: wer
+          weight: 1.0
+          use_cer: false
+          one_minus_error: true
+    normalize_advantage: true
+    advantage_eps: 1e-8
+    sft_weight: 0.05
+
+    # Memory-first defaults (slow but small).
+    freeze_preprocessor: true
+    freeze_encoder: true
+    encoder_no_grad: true
+    enforce_eval_on_frozen_modules: true
+
+    # Stability: keep modules in train() but set dropout=0 in config (see below).
+    # NOTE: For cuDNN RNNs, calling `.eval()` can break backward when dropout>0.
+    disable_decoder_dropout: false
+    disable_joint_dropout: false
+
+    # Diagnostics.
+    log_diagnostics: true
+    log_diagnostics_every_n_steps: 50
+    log_text_every_n_steps: 50
+    diagnostics_once_per_global_step: true
+    sync_dist_core_metrics: true
+    sync_dist_extra_metrics: true
+
+    # PPO epochs (sample reuse). Not implemented yet; keep at 1.
+    ppo_epochs: 1
+
+    # Optimization: Batch N-best hypotheses for logp computation (faster, more memory).
+    batch_hypotheses: false
+
+    empty_hyp_logp: -100.0
+
+  # GSPO requires n-best hypotheses (beam + return_best_hypothesis=False).
+  decoding:
+    strategy: "beam"
+    beam:
+      beam_size: ${model.gspo.group_size}
+      return_best_hypothesis: False
+
+  # Memory-first: batch_size=1 + gradient accumulation.
+  train_ds:
+    batch_size: 1
+
+  # Disable dropout for deterministic GSPO rollouts/logp, without switching modules to eval().
+  decoder:
+    prednet:
+      dropout: 0.0
+
+  # Post-training targets RNNT/TDT branch only (no aux CTC loss).
+  aux_ctc:
+    ctc_loss_weight: 0.0
+
+  # Keep fused joint+loss enabled (works with GSPO via per-hypothesis loss calls).
+  joint:
+    preserve_memory: true
+    fuse_loss_wer: true
+    fused_batch_size: 1
+    jointnet:
+      dropout: 0.0
+
+trainer:
+  accumulate_grad_batches: 16
+  precision: bf16

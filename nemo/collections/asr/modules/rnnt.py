@@ -1639,6 +1639,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             A torch.Tensor of shape [B, T, H]
         """
+        # Work around mixed-precision autocast edge cases (observed with some NVIDIA PyTorch builds) by
+        # running this projection outside autocast and matching the parameter dtype explicitly.
+        if encoder_output.is_cuda and torch.is_autocast_enabled():
+            with torch.autocast(device_type="cuda", enabled=False):
+                encoder_output = encoder_output.to(dtype=self.enc.weight.dtype)
+                return self.enc(encoder_output)
         return self.enc(encoder_output)
 
     def project_prednet(self, prednet_output: torch.Tensor) -> torch.Tensor:
@@ -1651,6 +1657,12 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         Returns:
             A torch.Tensor of shape [B, U, H]
         """
+        # Work around mixed-precision autocast edge cases (observed with some NVIDIA PyTorch builds) by
+        # running this projection outside autocast and matching the parameter dtype explicitly.
+        if prednet_output.is_cuda and torch.is_autocast_enabled():
+            with torch.autocast(device_type="cuda", enabled=False):
+                prednet_output = prednet_output.to(dtype=self.pred.weight.dtype)
+                return self.pred(prednet_output)
         return self.pred(prednet_output)
 
     def joint_after_projection(self, f: torch.Tensor, g: torch.Tensor) -> torch.Tensor:
@@ -1700,7 +1712,14 @@ class RNNTJoint(rnnt_abstract.AbstractRNNTJoint, Exportable, AdapterModuleMixin)
         if self.is_adapter_available():
             inp = self.forward_enabled_adapters(inp)
 
-        res = self.joint_net(inp)  # [B, T, U, V + 1]
+        # Work around mixed-precision autocast edge cases (observed with some NVIDIA PyTorch builds).
+        if inp.is_cuda and torch.is_autocast_enabled():
+            with torch.autocast(device_type="cuda", enabled=False):
+                param_dtype = next(self.joint_net.parameters()).dtype
+                inp = inp.to(dtype=param_dtype)
+                res = self.joint_net(inp)  # [B, T, U, V + 1]
+        else:
+            res = self.joint_net(inp)  # [B, T, U, V + 1]
 
         del inp
 

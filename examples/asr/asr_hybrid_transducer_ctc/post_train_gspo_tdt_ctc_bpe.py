@@ -60,6 +60,21 @@ from nemo.utils.trainer_utils import resolve_trainer_cfg
 def main(cfg):
     logging.info(f'Hydra config:\n{OmegaConf.to_yaml(cfg)}')
 
+    # Basic guardrails: GSPO is high-variance; too-small effective batch often collapses the model.
+    try:
+        train_bsz = int(getattr(getattr(cfg, "model", None), "train_ds", {}).get("batch_size", 0))
+        accum = int(getattr(cfg, "trainer", {}).get("accumulate_grad_batches", 1))
+        group_size = int(getattr(getattr(cfg, "model", None), "gspo", {}).get("group_size", 0))
+        if train_bsz == 1 and accum == 1 and group_size >= 8:
+            logging.warning(
+                "GSPO config looks extremely high-variance (train_ds.batch_size=1, "
+                "trainer.accumulate_grad_batches=1, gspo.group_size>=8). "
+                "This often leads to WER collapse. Consider setting trainer.accumulate_grad_batches>=16 "
+                "and/or increasing sft_weight / lowering LR."
+            )
+    except Exception:
+        pass
+
     trainer = pl.Trainer(**resolve_trainer_cfg(cfg.trainer))
     exp_manager(trainer, cfg.get("exp_manager", None))
 

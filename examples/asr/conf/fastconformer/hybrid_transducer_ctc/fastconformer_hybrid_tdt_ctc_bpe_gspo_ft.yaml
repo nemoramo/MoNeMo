@@ -1,0 +1,39 @@
+# Stage-2 fine-tuning config for GSPO post-training.
+#
+# Usage example:
+#   python examples/asr/asr_hybrid_transducer_ctc/post_train_gspo_tdt_ctc_bpe.py \
+#     --config-name fastconformer_hybrid_tdt_ctc_bpe_gspo_ft \
+#     init_from_ptl_ckpt=/path/to/stage1_best.ckpt \
+#     # OR: init_from_nemo_model=/path/to/stage1_model.nemo \
+#     model.train_ds.manifest_filepath=/path/to/train.jsonl \
+#     model.validation_ds.manifest_filepath=/path/to/val.jsonl \
+#     model.tokenizer.dir=/path/to/tokenizer_dir
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe_110m_gspo
+  - _self_
+
+name: "FastConformer-Hybrid-TDT-CTC-BPE-110M-GSPO-FT"
+
+model:
+  # Small LR for post-training finetune.
+  optim:
+    name: adamw
+    lr: 1e-5
+    betas: [0.9, 0.98]
+    weight_decay: 1e-4
+    sched:
+      # Keep LR constant (no decay) unless you add `hold_ratio` / a decay scheduler.
+      name: WarmupHoldPolicy
+      warmup_steps: 0
+      warmup_ratio: null
+      hold_steps: 0
+      hold_ratio: null
+      min_lr: 0.0
+
+trainer:
+  # GSPO is much slower than supervised training; prefer max_steps to cap runtime.
+  # Override via CLI when needed.
+  max_steps: 10000
+  max_epochs: 999
+  val_check_interval: 2000
