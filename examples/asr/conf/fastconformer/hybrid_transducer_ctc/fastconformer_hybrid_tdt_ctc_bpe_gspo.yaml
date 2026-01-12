@@ -1,0 +1,143 @@
+# GSPO post-training config (memory-first, slow OK).
+#
+# This config composes the standard training config and overrides only the parts
+# needed for GSPO post-training.
+#
+# References:
+# - PPO: https://arxiv.org/abs/1707.06347
+# - TDT: https://arxiv.org/abs/2304.06795
+# - GSPO discussion: https://arxiv.org/pdf/2507.18071
+
+defaults:
+  - fastconformer_hybrid_tdt_ctc_bpe
+  - _self_
+
+name: "FastConformer-Hybrid-TDT-CTC-BPE-GSPO"
+
+model:
+  # Optional: disable spec augmentation during post-training for stable reward signal.
+  spec_augment: null
+
+  # GSPO knobs (consumed by EncDecHybridRNNTCTCBPEModelGSPO).
+  gspo:
+    clip_eps: 0.2
+    group_size: 4
+    # Unified reward interface (supports multiple reward terms with weights).
+    # Default: verifiable reward = 1 - WER.
+    reward:
+      components:
+        - name: wer
+          weight: 1.0
+          use_cer: false
+          one_minus_error: true
+    normalize_advantage: true
+    advantage_eps: 1e-8
+    sft_weight: 0.05
+
+    # Memory-first defaults (slow but small).
+    freeze_preprocessor: true
+    freeze_encoder: true
+    encoder_no_grad: true
+    enforce_eval_on_frozen_modules: true
+
+    # Stability: disable dropout during rollout/logp computations.
+    disable_decoder_dropout: true
+    disable_joint_dropout: true
+
+    # Diagnostics (TensorBoard + optional text logs).
+    # These are "canaries" to catch silent bugs (dropout on, logp mismatch, etc).
+    log_diagnostics: true
+    log_diagnostics_every_n_steps: 50
+    log_text_every_n_steps: 50
+    # Under grad accumulation, run expensive diagnostics/prints/one-time validations at most once per optimizer step.
+    diagnostics_once_per_global_step: true
+    # Distributed logging controls (DDP).
+    sync_dist_core_metrics: true
+    sync_dist_extra_metrics: true
+    # Optional (slower): record coarse encode/decode/logp timings.
+    # log_timings: true
+    # timing_sync_cuda: false
+    # Optional: log gradient norms.
+    # log_grad_norm: true
+    # grad_norm_every_n_steps: 50
+
+    # Optional one-time hard validation for fused logp semantics.
+    # This materializes the full joint tensor [B, T, U, V] and may OOM for long sequences.
+    # validate_fused_logp_once: true
+    # validate_fused_logp_max_joint_elements: 50000000
+
+    # Roadmap: PPO epochs (sample reuse). Not implemented yet; keep at 1.
+    ppo_epochs: 1
+
+    # Optimization: Batch N-best hypotheses for logp computation.
+    # Faster but uses more memory.
+    batch_hypotheses: false
+
+    # Penalty logp for empty hypotheses (e.g. -100.0).
+    empty_hyp_logp: -100.0
+
+    # Alternative: allow encoder fine-tuning (higher memory).
+    # freeze_encoder: false
+    # encoder_no_grad: false
+
+    # TODO (future): make the objective closer to "true PPO/GSPO" semantics.
+    # Current implementation computes logp_old/logp_new within the same training_step()
+    # and behaves like an on-policy sequence-level policy-gradient / MWER-style objective.
+    #
+    # Future options (not implemented yet; shown here as a roadmap):
+    # - Old-policy snapshot: maintain a lagged copy of decoder/joint as pi_old (sync every N steps).
+    # - KL regularization: add optional KL-to-reference to control drift.
+    #
+    # old_policy_sync_interval: 500
+    # kl_beta: 0.01
+
+    # Reward examples:
+    # - Add CER alongside WER:
+    # reward:
+    #   components:
+    #     - name: wer
+    #       weight: 1.0
+    #       one_minus_error: true
+    #     - name: cer
+    #       weight: 0.2
+    #       one_minus_error: true
+    #
+    # - Use Hydra instantiate for custom rewards (implement your own TextRewardComponent):
+    # reward:
+    #   _target_: nemo.collections.asr.parts.rl.rewards.WeightedSumTextReward
+    #   components:
+    #     - _target_: nemo.collections.asr.parts.rl.rewards.TextErrorRateReward
+    #       name: wer
+    #       weight: 1.0
+    #       use_cer: false
+    #       one_minus_error: true
+    #     - _target_: your_pkg.your_module.YourCustomReward
+    #       weight: 0.05
+    #       ...: ...
+
+  # GSPO requires n-best hypotheses (beam + return_best_hypothesis=False).
+  decoding:
+    strategy: "beam"
+    beam:
+      beam_size: ${model.gspo.group_size}
+      return_best_hypothesis: False
+
+  # Memory-first: batch_size=1 + gradient accumulation.
+  train_ds:
+    batch_size: 1
+
+  # Post-training targets RNNT/TDT branch only (no aux CTC loss).
+  aux_ctc:
+    ctc_loss_weight: 0.0
+
+  # Keep fused joint+loss enabled (works with GSPO via per-hypothesis loss calls).
+  joint:
+    preserve_memory: true
+    fuse_loss_wer: true
+    fused_batch_size: 1
+
+trainer:
+  # Increase this to emulate a larger effective batch size.
+  accumulate_grad_batches: 16
+  # Use `bf16` if supported, else `16`.
+  precision: bf16
