@@ -1029,6 +1029,7 @@ def get_batch_variables(
     buffered_chunk_params: dict = {},
     padding_value: float = -3.4e38,
     has_hypotheses: bool = False,
+    num_workers: int = 0,
 ):
     """
     Args:
@@ -1045,6 +1046,8 @@ def get_batch_variables(
         buffered_chunk_params: a dictionary, containing the parameters for the buffered chunked streaming.
         padding_value: a float, the value to use for padding the log_probs tensor.
         has_hypotheses: a boolean, if True, the audio has already been processed and hypotheses are provided.
+        num_workers: an integer, the number of workers for DataLoader. Useful for speeding up data loading
+            when processing large batches of short audio files where data IO is slower than GPU computation.
 
     Returns:
         log_probs_batch: a tensor of shape (B, T_max, V) - contains the log probabilities of the tokens for each utterance in the batch.
@@ -1098,14 +1101,14 @@ def get_batch_variables(
                 if has_hypotheses:
                     hypotheses = audio
                 else:
-                    hypotheses = model.transcribe(audio, return_hypotheses=True, batch_size=batch_size)
+                    hypotheses = model.transcribe(audio, return_hypotheses=True, batch_size=batch_size, num_workers=num_workers)
         else:
             assert isinstance(audio, list) or isinstance(
                 audio, str
             ), "audio must be a list of audio files or a single audio file"
             with torch.no_grad():
                 hypotheses = model.transcribe_simulate_cache_aware_streaming(
-                    audio, return_hypotheses=True, batch_size=batch_size
+                    audio, return_hypotheses=True, batch_size=batch_size, num_workers=num_workers
                 )
 
         # if hypotheses form a tuple (from Hybrid model), extract just "best" hypothesis

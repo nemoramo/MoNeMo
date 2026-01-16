@@ -146,6 +146,7 @@ class AlignmentConfig:
     transcribe_device: Optional[str] = None
     viterbi_device: Optional[str] = None
     batch_size: int = 1
+    num_workers: int = 0  # Number of workers for DataLoader, useful for large batches of short audio files
     use_local_attention: bool = True
     additional_segment_grouping_separator: Optional[List[str]] = field(default_factory=lambda: ['.', '?', '!', '...'])
     audio_filepath_parts_in_utt_id: int = 1
@@ -359,6 +360,7 @@ def main(cfg: AlignmentConfig):
                 simulate_cache_aware_streaming=cfg.simulate_cache_aware_streaming,
                 use_buffered_chunked_streaming=cfg.use_buffered_chunked_streaming,
                 buffered_chunk_params=buffered_chunk_params,
+                num_workers=cfg.num_workers,
             )
 
         # Ensure float32 for Viterbi decoding stability and padding handling
