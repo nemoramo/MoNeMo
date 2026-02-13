@@ -17,6 +17,7 @@
 
 """Utilities for models."""
 import itertools
+import os
 from typing import Dict, Iterator, List, Optional, Union
 
 import torch
@@ -34,12 +35,19 @@ except (ImportError, ModuleNotFoundError):
     HAVE_APEX = False
 
 try:
+    # NOTE: For NFA/ASR inference workloads we don't need Megatron-Core.
+    # Megatron-Core import can trigger torch cpp_extension builds (e.g. unified_memory)
+    # which may leave stale lock files if interrupted. Allow disabling it via env.
+    if os.getenv("NEMO_DISABLE_MEGATRON_CORE", "").lower() in {"1", "true", "yes"}:
+        raise ModuleNotFoundError("Disabled by NEMO_DISABLE_MEGATRON_CORE")
+
     from megatron.core import parallel_state
 
     HAVE_MEGATRON_CORE = True
 
 except (ImportError, ModuleNotFoundError):
 
+    parallel_state = None  # type: ignore[assignment]
     HAVE_MEGATRON_CORE = False
 
 

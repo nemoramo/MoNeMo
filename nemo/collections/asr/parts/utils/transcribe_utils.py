@@ -24,7 +24,6 @@ import torch
 from omegaconf import DictConfig
 from tqdm.auto import tqdm
 
-from nemo.collections.asr.metrics.wer import word_error_rate
 from nemo.collections.asr.models import ASRModel, EncDecMultiTaskModel
 from nemo.collections.asr.parts.utils import manifest_utils, rnnt_utils
 from nemo.collections.asr.parts.utils.streaming_utils import FrameBatchASR, FrameBatchMultiTaskAED
@@ -645,6 +644,8 @@ def compute_metrics_per_sample(
     use_wer = "wer" in metrics
     use_cer = "cer" in metrics
     use_punct_er = "punct_er" in metrics
+    if use_wer or use_cer:
+        from nemo.collections.asr.metrics.wer import word_error_rate
 
     with open(manifest_path, 'r') as manifest:
         lines = manifest.readlines()
