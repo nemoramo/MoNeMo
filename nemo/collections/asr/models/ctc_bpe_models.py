@@ -20,7 +20,6 @@ import torch
 from omegaconf import DictConfig, ListConfig, OmegaConf, open_dict
 
 from nemo.collections.asr.data import audio_to_text_dataset
-from nemo.collections.asr.data.audio_to_text import _AudioTextDataset
 from nemo.collections.asr.data.audio_to_text_dali import AudioToBPEDALIDataset
 from nemo.collections.asr.data.audio_to_text_lhotse import LhotseSpeechToTextBpeDataset
 from nemo.collections.asr.losses.ctc import CTCLoss
@@ -138,29 +137,18 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             # support datasets that are lists of lists
             collate_fn = dataset.datasets[0].datasets[0].collate_fn
 
-        sampler = None
-        dataloader_batch_size = config['batch_size']
-        dataloader_drop_last = config.get('drop_last', False)
-        if config.get('use_semi_sorted_batching', False):
-            if not isinstance(dataset, _AudioTextDataset):
-                raise RuntimeError(
-                    "Semi Sorted Batch sampler can be used with AudioToCharDataset or AudioToBPEDataset "
-                    f"but found dataset of type {type(dataset)}"
-                )
-            # set batch_size and batch_sampler to None to disable automatic batching
-            sampler = get_semi_sorted_batch_sampler(self, dataset, config)
-            dataloader_batch_size = None
-            dataloader_drop_last = False
-            shuffle = False
+        sampler, batch_sampler, dataloader_batch_size, dataloader_drop_last, shuffle = resolve_asr_dataloader_batching(
+            self, dataset, config, shuffle
+        )
 
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=dataloader_batch_size,
             sampler=sampler,
-            batch_sampler=None,
+            batch_sampler=batch_sampler,
             collate_fn=collate_fn,
             drop_last=dataloader_drop_last,
-            shuffle=shuffle if sampler is None else False,
+            shuffle=shuffle if sampler is None and batch_sampler is None else False,
             num_workers=config.get('num_workers', 0),
             pin_memory=config.get('pin_memory', False),
         )
