@@ -186,3 +186,4 @@ slurm*.out
 node_modules/
 .vite/
 bot_server.*
+.worktrees/
