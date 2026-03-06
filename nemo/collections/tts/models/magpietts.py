@@ -15,6 +15,7 @@ import copy
 import json
 import os
 import random
+import re
 import time
 from dataclasses import dataclass, field, fields
 from functools import partial
@@ -34,6 +35,7 @@ from torch.utils.data import get_worker_info
 from nemo.collections.common.data.lhotse import get_lhotse_dataloader_from_config
 from nemo.collections.tts.data.text_to_speech_dataset_lhotse import MagpieTTSLhotseDataset, setup_tokenizers
 from nemo.collections.tts.losses.aligner_loss import ForwardSumLoss
+from nemo.collections.tts.losses.moe_loss import MoEAuxiliaryLoss, compute_expert_usage
 from nemo.collections.tts.models import AudioCodecModel
 from nemo.collections.tts.modules import transformer_2501
 from nemo.collections.tts.modules.aligner import AlignmentEncoder
@@ -311,17 +313,17 @@ class MagpieTTSModel(ModelPT):
     Supports multiple model types:
 
     - multi_encoder_context_tts: Transcript and context audio go to different encoders. Transcript encoding feeds to
-    layers given by cfg.model.transcript_decoder_layers and the context encoding feeds into the layers given by
-    context_decoder_layers .Also supports text context which gets encoded by the same encoder as context audio.
-    Only one of context audio or contex text is supported.
+      layers given by cfg.model.transcript_decoder_layers and the context encoding feeds into the layers given by
+      context_decoder_layers .Also supports text context which gets encoded by the same encoder as context audio.
+      Only one of context audio or contex text is supported.
 
     - decoder_context_tts: Text goes into the encoder; context & target audio go to the decoder. Also supports text
-    context. Supports fixed sized context so we set context_duration_min and context_duration_max to the same
-    value (5 seconds). Text context, which is usually shorter than number of codec frames of 5 second of audio, is
-    padded to the max context duration in this model.
+      context. Supports fixed sized context so we set context_duration_min and context_duration_max to the same
+      value (5 seconds). Text context, which is usually shorter than number of codec frames of 5 second of audio, is
+      padded to the max context duration in this model.
 
     - decoder_ce: Same as decoder_context_tts except there is a small neural network between the context tensors and
-    the decoder input.
+      the decoder input.
     """
 
     def __init__(self, cfg: DictConfig, trainer: 'Trainer' = None):
@@ -504,6 +506,7 @@ class MagpieTTSModel(ModelPT):
 
         self.encoder = transformer_2501.Transformer(**dict(cfg.encoder))
         self.decoder = transformer_2501.Transformer(**dict(cfg.decoder))
+
         self.final_proj = nn.Linear(
             cfg.decoder.d_model,
             self.num_audio_codebooks * self.num_all_tokens_per_codebook * self.frame_stacking_factor,
@@ -558,7 +561,12 @@ class MagpieTTSModel(ModelPT):
             for layer in self.context_decoder_layers:
                 multi_encoder_mapping[layer] = 1
             self.multi_encoder_mapping = multi_encoder_mapping
-            self.context_encoder = transformer_2501.Transformer(**dict(cfg.context_encoder))
+            # Create context encoder (filter out MoE loss coefficients if present)
+            # Note: Loss coefficients are model-level config, not passed to Transformer module
+            context_encoder_cfg = dict(cfg.context_encoder)
+            context_encoder_cfg.pop('router_load_balancing_loss_coeff', None)
+            context_encoder_cfg.pop('router_z_loss_coeff', None)
+            self.context_encoder = transformer_2501.Transformer(**context_encoder_cfg)
         elif self.model_type == 'decoder_context_tts':
             # Context audio/text goes directly to the decoder (before the target audio codes)
             self.transcript_decoder_layers = [
@@ -567,7 +575,10 @@ class MagpieTTSModel(ModelPT):
         elif self.model_type == 'decoder_ce':
             # Similar to decoder_context_tts, but we use context encoder
             # Decoder gets output from context encoder instead of raw context tokens embeddings
-            self.context_encoder = transformer_2501.Transformer(**dict(cfg.context_encoder))
+            context_encoder_cfg = dict(cfg.context_encoder)
+            context_encoder_cfg.pop('router_load_balancing_loss_coeff', None)
+            context_encoder_cfg.pop('router_z_loss_coeff', None)
+            self.context_encoder = transformer_2501.Transformer(**context_encoder_cfg)
             self.transcript_decoder_layers = [
                 idx for idx in range(cfg.decoder.n_layers)
             ]  # All layers are used for text
@@ -587,6 +598,35 @@ class MagpieTTSModel(ModelPT):
             self.alignment_loss = ForwardSumLoss(loss_scale=self.alignment_loss_scale)
         if self.alignment_encoder_loss_scale > 0.0:
             self.alignment_encoder_loss = ForwardSumLoss(loss_scale=self.alignment_encoder_loss_scale)
+
+        # Initialize MoE losses if MoE is enabled in decoder
+        self.use_moe = cfg.get('use_moe', False)
+        if self.use_moe:
+            num_experts = cfg.decoder.get('num_experts', 8)
+            routing_strategy = cfg.decoder.get('routing_strategy', 'top_k')
+
+            router_load_balancing_loss_coeff = cfg.get('router_load_balancing_loss_coeff', 0.01)
+            router_z_loss_coeff = cfg.get('router_z_loss_coeff', 0.001)
+
+            # Sinkhorn routing already ensures balanced expert assignment through its doubly stochastic property
+            # Load balancing loss is redundant and incompatible with Sinkhorn
+            if routing_strategy == 'sinkhorn' and router_load_balancing_loss_coeff > 0:
+                raise ValueError(
+                    f"Invalid configuration: routing_strategy='sinkhorn' with router_load_balancing_loss_coeff={router_load_balancing_loss_coeff} > 0. "
+                    f"Sinkhorn routing already ensures balanced expert load through doubly stochastic constraints. "
+                    f"Set router_load_balancing_loss_coeff=0.0 when using Sinkhorn routing to avoid redundant penalization."
+                )
+
+            self.moe_auxiliary_loss = MoEAuxiliaryLoss(
+                num_experts=num_experts,
+                load_balancing_loss_scale=router_load_balancing_loss_coeff,
+                router_z_loss_scale=router_z_loss_coeff,
+            )
+            logging.info(
+                f"MoE enabled in decoder with {num_experts} experts, routing_strategy={routing_strategy}. "
+                f"Each expert has d_ffn={cfg.decoder.d_ffn}. "
+                f"Loss scales: router_load_balancing={router_load_balancing_loss_coeff}, router_z={router_z_loss_coeff}"
+            )
 
         # Define cfg parameters into self parameters
         self.prior_end_step = self.cfg.prior_end_step
@@ -1067,10 +1107,11 @@ class MagpieTTSModel(ModelPT):
         | seq. index |    0    |    1    |    2    |    3    |    4    |    5    |    6    |    7    |    8    |
         +------------+---------+---------+---------+---------+---------+---------+---------+---------+---------+
 
-        dec_out: (B, T', E)
-        audio_codes_target: (B, C, T')
-        targets_offset_by_one: bool, if False, the target for index 0 is codebook 0, for index 1 is codebook 1, etc. (autoregressive)
-                                     if True,  the target for index 1 is codebook 0, for index 2 is codebook 1, etc. (MaskGit)
+        Args:
+            dec_out: (B, T', E)
+            audio_codes_target: (B, C, T')
+            targets_offset_by_one: bool, if False, the target for index 0 is codebook 0, for index 1 is codebook 1, etc. (autoregressive)
+                if True,  the target for index 1 is codebook 0, for index 2 is codebook 1, etc. (MaskGit)
         """
         C = self.num_audio_codebooks
         dec_out_all = dec_out.reshape(-1, dec_out.size(-1))  # (B*T', E)
@@ -1159,16 +1200,18 @@ class MagpieTTSModel(ModelPT):
 
     def compute_loss(self, logits, audio_codes, audio_codes_lens, mask_tokens_mask=None, frame_stacking_factor=1):
         """
-        Computes the audio codebook loss. Used by
+        Computes the audio codebook loss. Used by:
+
         (1) The main Magpie-TTS transformer
         (2) The local transformer, for both autoregressive and MaskGit methods
 
-        logits: (B, T', num_codebooks * num_tokens_per_codebook)
-        audio_codes: (B, C, T')
-        audio_codes_lens: (B,)
-        mask_tokens_mask: (B, C, T') True for tokens that were replaced with the MASK_TOKEN and should
-                                     therefore be the only ones included in the loss computation (for MaskGit).
-        frame_stacking_factor: int, the stacking factor used in the model
+        Args:
+            logits: (B, T', num_codebooks * num_tokens_per_codebook)
+            audio_codes: (B, C, T')
+            audio_codes_lens: (B,)
+            mask_tokens_mask: (B, C, T') True for tokens that were replaced with the MASK_TOKEN and should
+                therefore be the only ones included in the loss computation (for MaskGit).
+            frame_stacking_factor: int, the stacking factor used in the model
         """
         loss_mask = get_mask_from_lengths(audio_codes_lens, pad_to_factor=frame_stacking_factor)
         if mask_tokens_mask is not None:
@@ -1210,6 +1253,30 @@ class MagpieTTSModel(ModelPT):
         return total_codebook_loss, loss_mask
 
     def forward(self, dec_input_embedded, dec_input_mask, cond, cond_mask, attn_prior, multi_encoder_mapping):
+        """
+        Forward pass through the decoder transformer, followed by a linear projection to audio codebook logits.
+
+        Args:
+            dec_input_embedded (torch.Tensor): Embedded decoder input of shape (B, T, C).
+            dec_input_mask (torch.Tensor): Boolean mask for decoder input of shape (B, T).
+            cond (torch.Tensor or List[torch.Tensor]): Conditioning tensor(s) for cross-attention.
+            cond_mask (torch.Tensor or List[torch.Tensor]): Mask(s) for conditioning tensor(s).
+            attn_prior (torch.Tensor or None): Prior attention weights for cross-attention.
+            multi_encoder_mapping (List[Optional[int]] or None): Per-layer mapping to conditioning inputs.
+
+        Returns:
+            Tuple of:
+
+            - all_code_logits (torch.Tensor): Logits of shape (B, T', num_codebooks * num_tokens_per_codebook).
+            - attn_probabilities (list): Attention probabilities from each decoder layer.
+            - dec_output (torch.Tensor): Raw decoder output of shape (B, T', d_model).
+            - moe_routing_info (list or None): None if MoE is disabled. If MoE is enabled,
+              a list of dicts (one per layer) each containing:
+
+              - 'router_logits' (torch.Tensor): Raw router logits (B, T, num_experts).
+              - 'router_probs' (torch.Tensor): Router probabilities (B, T, num_experts).
+              - 'expert_indices' (torch.Tensor): Selected expert indices (B, T, top_k).
+        """
         decoder_out = self.decoder(
             dec_input_embedded,
             dec_input_mask,
@@ -1219,8 +1286,9 @@ class MagpieTTSModel(ModelPT):
             multi_encoder_mapping=multi_encoder_mapping,
         )
         attn_probabilities = decoder_out['attn_probabilities']
+        moe_routing_info = decoder_out.get('moe_routing_info', None)  # Extract MoE routing info for loss computation
         all_code_logits = self.final_proj(decoder_out['output'])  # (B, T', num_codebooks * num_tokens_per_codebook)
-        return all_code_logits, attn_probabilities, decoder_out['output']
+        return all_code_logits, attn_probabilities, decoder_out['output'], moe_routing_info
 
     def logits_to_audio_codes(self, all_code_logits, audio_codes_lens):
         # all_code_logits: (B, T', num_codebooks * num_tokens_per_codebook)
@@ -1280,10 +1348,11 @@ class MagpieTTSModel(ModelPT):
         Sets logits of forbidden tokens to `-inf` so they will never be sampled.
         Specifically, we forbid sampling of all special tokens except AUDIO_EOS
         which is allowed by default.
+
         Args:
             logits: (B, C, num_audio_tokens_per_codebook)
             forbid_audio_eos (bool, optional): If True, also forbid AUDIO_EOS tokens
-                                               from being sampled. Default: False.
+                from being sampled. Default: False.
         """
         logits[
             :,
@@ -1326,6 +1395,7 @@ class MagpieTTSModel(ModelPT):
         Uses multinomial sampling with temperature, top-k, and classifier-free guidance (CFG).
 
         Special handling:
+
         * forbids special tokens (like AUDIO_BOS, AUDIO_CONTEXT_EOS, etc.) from being sampled
         * forces / forbids EOS for finished / unfinished items respectively
         * optionally, globally forbids audio EOS for all items in the batch.
@@ -1354,12 +1424,13 @@ class MagpieTTSModel(ModelPT):
             dynamic_cfg_scale (bool, optional): Whether to dynamically adjust CFG scale during
                 sampling (experimental).
             sampling_type (str, optional): Type of sampling strategy. Options are:
-             ["default", "causal", "purity_causal", "purity_default"].
-             * Purity refers to "purity sampling" from https://arxiv.org/abs/2304.01515. If "purity"
-               is not specified, confidence sampling is used as in the original MaskGit paper.
-             * "default"/"causal": Controls the order of unmasking across frames when frame-stacking is enabled.
-                                   If "causal" is specified, frames are unmasked in causal order. "default"
-                                   doesn't impose any constraints on the unmasking order.
+                ["default", "causal", "purity_causal", "purity_default"].
+
+                * Purity refers to "purity sampling" from https://arxiv.org/abs/2304.01515. If "purity"
+                  is not specified, confidence sampling is used as in the original MaskGit paper.
+                * "default"/"causal": Controls the order of unmasking across frames when frame-stacking is enabled.
+                  If "causal" is specified, frames are unmasked in causal order. "default"
+                  doesn't impose any constraints on the unmasking order.
             forbid_audio_eos (bool, optional): Whether to globally forbid audio EOS for the entire
                 batch.
 
@@ -2471,7 +2542,7 @@ class MagpieTTSModel(ModelPT):
                 if (self.global_step > self.binarize_prior_after_step) and context_tensors.prior_used:
                     attn_prior = self.replace_beta_binomial_prior_with_binarized(attn_prior, aligner_attn_hard)
 
-        logits, attn_info, dec_out = self.forward(
+        logits, attn_info, dec_out, moe_routing_info = self.forward(
             dec_input_embedded=audio_codes_embedded_input,
             dec_input_mask=audio_codes_mask,
             cond=cond,
@@ -2481,6 +2552,7 @@ class MagpieTTSModel(ModelPT):
         )
         # logits: (B, T', num_codebooks * num_tokens_per_codebook)
         # dec_out: (B, T', E)
+        # moe_routing_info: List of routing info dicts from each layer (if MoE enabled)
         dec_context_size = context_tensors.dec_context_size
         logits = logits[:, dec_context_size:, :]  # Remove the context audio embeddings from the logits
 
@@ -2549,6 +2621,93 @@ class MagpieTTSModel(ModelPT):
         if aligner_encoder_loss is not None:
             loss = loss + aligner_encoder_loss
 
+        # Compute MoE auxiliary losses and expert usage statistics if MoE is enabled
+        moe_load_balancing_loss = None
+        moe_router_z_loss = None
+        moe_expert_usage_stats = None
+
+        if self.use_moe and moe_routing_info is not None:
+            # The decoder input is: [context_audio | target_audio | padding]. MoE routing runs on this full concatenated
+            # sequence, so router_logits, router_probs, and expert_indices contain context audio dimensions. We include
+            # context audio in the MoE loss computation (not stripped like the main CE loss) because:
+            #   1. Load balancing loss needs to see all tokens the router dispatches, including context. Excluding
+            #      context would make experts that specialize in processing context audio look underused, producing
+            #      misleading gradients.
+            #   2. At inference, context audio is always present and routed through experts. Training the router to
+            #      balance load only on target tokens would create a train/inference mismatch in routing behavior.
+            # Padding is excluded via x_mask. Router already masks padded positions, router_logits/router_probs=0,
+            # expert_indices=-1, and we pass x_mask to loss functions to ensure averages are computed only over valid (non-padding) tokens.
+            all_router_logits = []
+            all_router_probs = []
+            all_expert_indices = []
+            for layer_routing_info in moe_routing_info:
+                all_router_logits.append(layer_routing_info['router_logits'])
+                all_router_probs.append(layer_routing_info['router_probs'])
+                all_expert_indices.append(layer_routing_info['expert_indices'])
+
+            # Concatenate across layers (batch dimension)
+            stacked_logits = torch.stack(all_router_logits, dim=0)  # (n_layers, B, T, num_experts)
+            stacked_probs = torch.stack(all_router_probs, dim=0)  # (n_layers, B, T, num_experts)
+            stacked_indices = torch.stack(all_expert_indices, dim=0)  # (n_layers, B, T, top_k)
+
+            # Reshape for loss computation
+            # merged_logits and merged_probs are (n_layers*B, T, num_experts)
+            merged_logits = stacked_logits.view(-1, stacked_logits.size(2), stacked_logits.size(3))
+            merged_probs = stacked_probs.view(-1, stacked_probs.size(2), stacked_probs.size(3))
+            # merged_indices is (n_layers*B, T, top_k)
+            merged_indices = stacked_indices.view(-1, stacked_indices.size(2), stacked_indices.size(3))
+
+            # Repeat mask for each layer: (B, T) -> (n_layers*B, T)
+            # Include ALL decoder input positions (context audio + target audio) in loss computation
+            # Context audio routing is important for inference quality. We want Expert specialization where some experts
+            # may specialize in processing context, or some may specialize in generating target, or both.
+            merged_mask = (
+                audio_codes_mask.unsqueeze(0).repeat(len(moe_routing_info), 1, 1).view(-1, audio_codes_mask.size(1))
+            )
+
+            # Compute MoE losses using the loss module (both train and val)
+            # Pass mask to ensure losses are computed only over valid tokens (excluding padding)
+            moe_load_balancing_loss, moe_router_z_loss, moe_total_loss = self.moe_auxiliary_loss(
+                router_logits=merged_logits,
+                router_probs=merged_probs,
+                x_mask=merged_mask,
+            )
+
+            # Compute expert usage statistics (averaged across all layers, batches, and valid tokens)
+            # This shows which experts are being used most frequently
+            with torch.no_grad():
+                # Use shared utility function for computing expert usage
+                expert_usage = compute_expert_usage(merged_probs, merged_mask)  # (num_experts,)
+
+                # Compute how often each expert is selected in top-k
+                # For padded positions, expert_indices=-1, so they don't match any valid expert (0 to num_experts-1)
+                num_experts = merged_probs.size(-1)
+                expert_selection_counts = torch.zeros(num_experts, device=merged_probs.device)
+                for expert_idx in range(num_experts):
+                    expert_selection_counts[expert_idx] = (merged_indices == expert_idx).float().sum()
+
+                # Normalize to get selection frequency over valid (non-padded) selections only
+                # Padded positions have expert_indices=-1, which don't match any valid expert
+                valid_selections = (merged_indices != -1).sum().float().clamp_min(1.0)
+                expert_selection_freq = expert_selection_counts / valid_selections
+
+                # Compute load balance metrics
+                batch_expert_usage_variance = expert_usage.var()
+                batch_expert_usage_max = expert_usage.max()
+                batch_expert_usage_min = expert_usage.min()
+
+                moe_expert_usage_stats = {
+                    'expert_usage': expert_usage.cpu(),  # (num_experts,)
+                    'expert_selection_freq': expert_selection_freq.cpu(),  # (num_experts,)
+                    'batch_expert_usage_variance': batch_expert_usage_variance.item(),
+                    'batch_expert_usage_max': batch_expert_usage_max.item(),
+                    'batch_expert_usage_min': batch_expert_usage_min.item(),
+                }
+
+            # Add MoE loss to total loss (only in training mode)
+            if self.training:
+                loss = loss + moe_total_loss
+
         return {
             'logits': logits,
             'attn_info': attn_info,
@@ -2559,6 +2718,9 @@ class MagpieTTSModel(ModelPT):
             'loss_mask': loss_mask,
             'alignment_loss': alignment_loss,
             'aligner_encoder_loss': aligner_encoder_loss,
+            'moe_load_balancing_loss': moe_load_balancing_loss,
+            'moe_router_z_loss': moe_router_z_loss,
+            'moe_expert_usage_stats': moe_expert_usage_stats,
             'audio_codes_target': audio_codes_target_unstacked,
             'audio_codes_lens_target': audio_codes_lens_target_unstacked,
             'text': context_tensors.text,
@@ -2585,6 +2747,14 @@ class MagpieTTSModel(ModelPT):
         local_transformer_loss = batch_output['local_transformer_loss']
         if local_transformer_loss is not None:
             self.log('train/local_transformer_loss', local_transformer_loss, prog_bar=True, sync_dist=True)
+
+        # Log MoE losses if MoE is enabled
+        moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
+        moe_router_z_loss = batch_output.get('moe_router_z_loss', None)
+        if moe_load_balancing_loss is not None:
+            self.log('train/moe_load_balancing_loss', moe_load_balancing_loss, prog_bar=True, sync_dist=True)
+        if moe_router_z_loss is not None:
+            self.log('train/moe_router_z_loss', moe_router_z_loss, prog_bar=True, sync_dist=True)
 
         # Log batch info
         batch_size, text_token_max_len = batch["text"].shape
@@ -2640,10 +2810,67 @@ class MagpieTTSModel(ModelPT):
         attn_info = batch_output['attn_info']
         text_lens = batch_output['text_lens']
         dec_context_size = batch_output['dec_context_size']
+
+        # Extract MoE losses and expert usage statistics if MoE is enabled
+        moe_load_balancing_loss = batch_output.get('moe_load_balancing_loss', None)
+        moe_router_z_loss = batch_output.get('moe_router_z_loss', None)
+        moe_expert_usage_stats = batch_output.get('moe_expert_usage_stats', None)
+
         if alignment_loss is None:
             alignment_loss = torch.tensor(0.0, device=loss.device)
         if aligner_encoder_loss is None:
             aligner_encoder_loss = torch.tensor(0.0, device=loss.device)
+        if moe_load_balancing_loss is None:
+            moe_load_balancing_loss = torch.tensor(0.0, device=loss.device)
+        if moe_router_z_loss is None:
+            moe_router_z_loss = torch.tensor(0.0, device=loss.device)
+
+        if batch_idx == 0 and self.global_rank == 0:
+            # Log MoE expert usage statistics to WandB (first batch only for visualization)
+            if self.use_moe and moe_expert_usage_stats is not None:
+                wandb_moe_first_batch_log = {}
+
+                # Log per-expert usage as bar chart
+                expert_usage = moe_expert_usage_stats['expert_usage'].numpy()
+                expert_selection_freq = moe_expert_usage_stats['expert_selection_freq'].numpy()
+
+                for logger in self.loggers:
+                    if isinstance(logger, WandbLogger):
+                        # Create bar chart for expert usage (routing probabilities)
+                        expert_names = [f"Expert_{i}" for i in range(len(expert_usage))]
+                        usage_data = [[name, usage] for name, usage in zip(expert_names, expert_usage)]
+                        wandb_moe_first_batch_log['val/expert_usage_distribution'] = wandb.plot.bar(
+                            wandb.Table(data=usage_data, columns=["Expert", "Usage"]),
+                            "Expert",
+                            "Usage",
+                            title="Expert Usage (Routing Probabilities)",
+                        )
+
+                        # Create bar chart for expert selection frequency (top-k selections)
+                        selection_data = [[name, freq] for name, freq in zip(expert_names, expert_selection_freq)]
+                        wandb_moe_first_batch_log['val/expert_selection_frequency'] = wandb.plot.bar(
+                            wandb.Table(data=selection_data, columns=["Expert", "Frequency"]),
+                            "Expert",
+                            "Frequency",
+                            title=f"Expert Selection Frequency (Top-{self.decoder.top_k_experts})",
+                        )
+
+                        # Log scalar metrics for numerical tracking
+                        wandb_moe_first_batch_log['val/batch_expert_usage_variance'] = moe_expert_usage_stats[
+                            'batch_expert_usage_variance'
+                        ]
+                        wandb_moe_first_batch_log['val/batch_expert_usage_max'] = moe_expert_usage_stats[
+                            'batch_expert_usage_max'
+                        ]
+                        wandb_moe_first_batch_log['val/batch_expert_usage_min'] = moe_expert_usage_stats[
+                            'batch_expert_usage_min'
+                        ]
+
+                        # Log individual expert usage percentages as scalars
+                        for idx, usage in enumerate(expert_usage):
+                            wandb_moe_first_batch_log[f'val/expert_{idx}_usage'] = float(usage)
+
+                        logger.experiment.log(wandb_moe_first_batch_log)
 
         if batch_idx == 0 and self.global_rank == 0:
             # Prepare dictionary for aggregated wandb logging
@@ -2718,7 +2945,17 @@ class MagpieTTSModel(ModelPT):
             'val_alignment_loss': alignment_loss,
             'val_local_transformer_loss': local_transformer_loss,
             'val_aligner_encoder_loss': aligner_encoder_loss,
+            'val_moe_load_balancing_loss': moe_load_balancing_loss,
+            'val_moe_router_z_loss': moe_router_z_loss,
         }
+
+        # Store expert usage stats for aggregation at epoch end
+        if moe_expert_usage_stats is not None:
+            # Store batch-level variance for aggregation at epoch end
+            val_output['val_batch_expert_usage_variance'] = torch.tensor(
+                moe_expert_usage_stats['batch_expert_usage_variance'], device=loss.device
+            )
+
         self.validation_step_outputs.append(val_output)
 
         return val_output
@@ -3076,7 +3313,7 @@ class MagpieTTSModel(ModelPT):
                             dummy_addition_dec_mask
                         )
 
-                    combined_logits, attn_probs, dec_out = self.forward(
+                    combined_logits, attn_probs, dec_out, _ = self.forward(
                         dec_input_embedded=cfg_audio_codes_embedded,
                         dec_input_mask=cfg_audio_codes_mask,
                         cond=cfg_cond,
@@ -3090,7 +3327,7 @@ class MagpieTTSModel(ModelPT):
                     all_code_logits = (1 - cfg_scale) * uncond_logits + cfg_scale * cond_logits
                 else:
                     batch_size = audio_codes_embedded.size(0)
-                    all_code_logits, attn_probs, dec_out = self.forward(
+                    all_code_logits, attn_probs, dec_out, _ = self.forward(
                         dec_input_embedded=_audio_codes_embedded,
                         dec_input_mask=_audio_codes_mask,
                         cond=context_tensors.cond,
@@ -3333,6 +3570,7 @@ class MagpieTTSModel(ModelPT):
         val_codebook_loss = collect("val_codebook_loss")
         val_alignment_loss = collect("val_alignment_loss")
         val_aligner_encoder_loss = collect("val_aligner_encoder_loss")
+
         # log val_loss in the same group as the other val metrics.
         self.log("val/loss", val_loss, prog_bar=True, sync_dist=True)
         # ensure val_loss is available for epoch-level checkpointing and filename generation without cluttering wandb logs.
@@ -3349,9 +3587,42 @@ class MagpieTTSModel(ModelPT):
         self.log("val/codebook_loss", val_codebook_loss, prog_bar=True, sync_dist=True)
         self.log("val/alignment_loss", val_alignment_loss, prog_bar=True, sync_dist=True)
         self.log("val/aligner_encoder_loss", val_aligner_encoder_loss, prog_bar=True, sync_dist=True)
+
         if self.local_transformer_type != LocalTransformerType.NO_LT:
             val_local_transformer_loss = collect("val_local_transformer_loss")
             self.log("val/local_transformer_loss", val_local_transformer_loss, prog_bar=True, sync_dist=True)
+
+        # Log MoE losses and expert usage if MoE is enabled
+        if self.use_moe:
+            val_moe_load_balancing_loss = collect("val_moe_load_balancing_loss")
+            val_moe_router_z_loss = collect("val_moe_router_z_loss")
+
+            # Log MoE losses
+            self.log("val/moe_load_balancing_loss", val_moe_load_balancing_loss, prog_bar=True, sync_dist=True)
+            self.log("val/moe_router_z_loss", val_moe_router_z_loss, prog_bar=True, sync_dist=True)
+
+            # Log expert usage variance (averaged across all validation batches)
+            if any('val_batch_expert_usage_variance' in x for x in self.validation_step_outputs):
+                # This is the MEAN of batch-level variances across the epoch
+                val_epoch_mean_expert_usage_variance = collect("val_batch_expert_usage_variance")
+                self.log(
+                    "val/expert_usage_variance_epoch_mean",
+                    val_epoch_mean_expert_usage_variance,
+                    prog_bar=False,
+                    sync_dist=True,
+                )
+
+                # Log interpretation hints
+                # Ideal variance for N experts: 0 (perfectly balanced)
+                # High variance (>0.01) indicates imbalanced expert usage
+                num_experts = self.cfg.decoder.get('num_experts', 8)
+                ideal_usage = 1.0 / num_experts
+                logging.info(
+                    f"MoE Expert Usage (Epoch Mean) - Ideal: {ideal_usage:.4f} per expert, "
+                    f"Variance: {val_epoch_mean_expert_usage_variance:.6f} "
+                    f"({'Balanced' if val_epoch_mean_expert_usage_variance < 0.01 else 'Imbalanced'})"
+                )
+
         self.validation_step_outputs.clear()  # free memory
 
     def get_dataset(self, dataset_cfg, dataset_type):
@@ -3605,6 +3876,10 @@ class MagpieTTSModel(ModelPT):
             raise ValueError(
                 "Model does not have a baked context embedding. Please use a checkpoint with a baked context embedding."
             )
+        # Workaround for bug in Ja normalizer, Ja normalizer does not work well with spaces.
+        if language == "ja":
+            transcript = re.sub(r'\s+', '', transcript)
+
         # Apply text normalization if requested
         normalized_text = (
             self._get_normalized_text(transcript=transcript, language=language) if apply_TN else transcript
@@ -4070,7 +4345,7 @@ class MagpieTTSModel(ModelPT):
                 )
                 cfg_audio_mask[batch_size:, : dummy_additional_decoder_input.size(1)] = dummy_addition_dec_mask
 
-            combined_logits, attn_probs, dec_out = self.forward(
+            combined_logits, attn_probs, dec_out, _ = self.forward(
                 dec_input_embedded=cfg_audio_embedded,
                 dec_input_mask=cfg_audio_mask,
                 cond=cfg_cond,
@@ -4084,7 +4359,7 @@ class MagpieTTSModel(ModelPT):
             all_code_logits = (1 - cfg_scale) * uncond_logits + cfg_scale * cond_logits
             # NOTE: Keep dec_out doubled for local transformer CFG handling
         else:
-            all_code_logits, attn_probs, dec_out = self.forward(
+            all_code_logits, attn_probs, dec_out, _ = self.forward(
                 dec_input_embedded=audio_codes_embedded,
                 dec_input_mask=audio_codes_mask,
                 cond=context_tensors.cond,
