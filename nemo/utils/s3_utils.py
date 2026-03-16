@@ -230,12 +230,20 @@ class S3Utils:
 
     @staticmethod
     def _get_client_cache_ttl_sec() -> int:
+        """
+        Parse per-thread S3 client/resource cache TTL from env.
+
+        Semantics for NEMO_S3_CLIENT_CACHE_TTL_SEC:
+          - ttl > 0: cache entries expire after ttl seconds.
+          - ttl == 0: disable cache usage (always rebuild client/resource).
+          - ttl < 0: never expire cached entries.
+        """
         raw = os.environ.get("NEMO_S3_CLIENT_CACHE_TTL_SEC", str(DEFAULT_CLIENT_CACHE_TTL_SEC))
         try:
             ttl = int(raw)
         except (TypeError, ValueError):
             ttl = DEFAULT_CLIENT_CACHE_TTL_SEC
-        return max(0, ttl)
+        return ttl
 
     @staticmethod
     def _resolve_client_env_overrides() -> Tuple[Optional[str], Optional[str], Optional[str]]:
@@ -359,7 +367,7 @@ class S3Utils:
 
         cache_key = None
         ttl_sec = S3Utils._get_client_cache_ttl_sec()
-        if use_cache:
+        if use_cache and ttl_sec != 0:
             cache_key = S3Utils._make_cache_key(
                 profile=profile,
                 creds=creds,
@@ -374,7 +382,7 @@ class S3Utils:
             entry = cache.get(cache_key)
             if entry is not None:
                 created_ts = entry.get('created_ts', 0.0)
-                if ttl_sec == 0 or (time.monotonic() - created_ts) <= ttl_sec:
+                if ttl_sec < 0 or (time.monotonic() - created_ts) <= ttl_sec:
                     return entry['obj']
                 cache.pop(cache_key, None)
 
