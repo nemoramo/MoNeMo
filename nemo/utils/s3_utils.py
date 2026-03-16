@@ -15,9 +15,10 @@
 import os
 import re
 import time
+import threading
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Any, Dict, Hashable, List, Optional, Tuple
 import logging as _py_logging
 
 import boto3
@@ -48,6 +49,10 @@ SHARED_MEM_DIR = '/dev/shm'
 DEFAULT_CHUNK_SIZE_MB = 64
 DEFAULT_MAX_READ_CONCURRENCY = 15
 DEFAULT_MAX_WRITE_CONCURRENCY = 10
+DEFAULT_CLIENT_CACHE_TTL_SEC = 30 * 60
+
+_ENDPOINT_URL_ENV_KEYS = ('AWS_ENDPOINT_URL', 'TOS_ENDPOINT', 'TOS_ENDPOINT_URL')
+_REGION_ENV_KEYS = ('AWS_DEFAULT_REGION', 'TOS_REGION')
 
 
 class S3Utils:
@@ -56,10 +61,12 @@ class S3Utils:
     """
 
     '''
-    Avoid caching boto3 client or resource as a class variable as it gets executed once during class construction.
-    When the security token expires, the client or resouece will be no longer valid.
-    Create a new resource as needed. To avoid multithreading errors, use different session for each thread.
+    Cache boto3 resources/clients per-process and per-thread with TTL to avoid re-creating
+    sessions on every sample fetch. This dramatically reduces small-object GET latency while
+    keeping token refresh safe via periodic rebuilds.
     '''
+
+    _RESOURCE_CACHE_LOCAL = threading.local()
 
     @staticmethod
     def s3_path_exists(s3_path: str, match_directory: bool = False) -> bool:
@@ -222,37 +229,170 @@ class S3Utils:
             return [S3Utils.build_s3_url(o.bucket_name, o.key) for o in objects_list]
 
     @staticmethod
+    def _get_client_cache_ttl_sec() -> int:
+        raw = os.environ.get("NEMO_S3_CLIENT_CACHE_TTL_SEC", str(DEFAULT_CLIENT_CACHE_TTL_SEC))
+        try:
+            ttl = int(raw)
+        except (TypeError, ValueError):
+            ttl = DEFAULT_CLIENT_CACHE_TTL_SEC
+        return max(0, ttl)
+
+    @staticmethod
+    def _resolve_client_env_overrides() -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        endpoint_url = None
+        for key in _ENDPOINT_URL_ENV_KEYS:
+            value = os.environ.get(key)
+            if value:
+                endpoint_url = value
+                break
+
+        region_name = None
+        for key in _REGION_ENV_KEYS:
+            value = os.environ.get(key)
+            if value:
+                region_name = value
+                break
+
+        addressing_style = (os.environ.get('TOS_ADDRESSING_STYLE') or '').strip().lower()
+        if addressing_style not in {'virtual', 'path'}:
+            addressing_style = None
+
+        return endpoint_url, region_name, addressing_style
+
+    @staticmethod
+    def _make_cache_key(
+        *,
+        profile: str,
+        creds: botocore.credentials.Credentials,
+        get_client: bool,
+        endpoint_url: Optional[str],
+        region_name: Optional[str],
+        config: Dict[str, Any],
+    ) -> Hashable:
+        if isinstance(creds, dict):
+            creds_fp = (
+                creds.get("AccessKeyId"),
+                creds.get("SecretAccessKey"),
+                creds.get("SessionToken"),
+            )
+        else:
+            creds_fp = repr(creds) if creds is not None else None
+
+        return (
+            profile,
+            creds_fp,
+            get_client,
+            endpoint_url,
+            region_name,
+            repr(config),
+        )
+
+    @staticmethod
+    def _build_resource(
+        *,
+        profile: str,
+        creds: botocore.credentials.Credentials,
+        session,
+        config_obj: botocore.config.Config,
+        endpoint_url: Optional[str],
+        region_name: Optional[str],
+    ):
+        if profile is not None and creds is not None:
+            raise ValueError('Please provide profile or creds or neither, not both.')
+
+        if profile is not None:
+            boto_session = boto3.Session(profile_name=profile, region_name=region_name)
+            return boto_session.resource('s3', config=config_obj, endpoint_url=endpoint_url)
+
+        if creds is not None:
+            return boto3.Session(region_name=region_name).resource(
+                's3',
+                aws_access_key_id=creds["AccessKeyId"],
+                aws_secret_access_key=creds["SecretAccessKey"],
+                aws_session_token=creds["SessionToken"],
+                config=config_obj,
+                endpoint_url=endpoint_url,
+            )
+
+        boto_session = session if session is not None else boto3.Session(region_name=region_name)
+        return boto_session.resource('s3', config=config_obj, endpoint_url=endpoint_url)
+
+    @staticmethod
     def _get_s3_resource(
         profile: str = None,
         creds: botocore.credentials.Credentials = None,
         get_client: bool = False,
         session=None,
-        config={},
+        config=None,
+        refresh: bool = False,
     ):
-        config = botocore.config.Config(max_pool_connections=30, **config)
+        cfg_kwargs: Dict[str, Any] = dict(config or {})
+        cfg_kwargs.setdefault('max_pool_connections', 30)
 
-        if profile is not None and creds is not None:
-            raise ValueError('Please provide profile or creds or neither, not both.')
+        endpoint_cfg = cfg_kwargs.pop('endpoint_url', None)
+        region_cfg = cfg_kwargs.pop('region_name', None)
+        s3_cfg = dict(cfg_kwargs.pop('s3', {}) or {})
 
-        if profile is not None:
-            s3 = boto3.Session(profile_name=profile).resource('s3', config=config)
-        elif creds is not None:
-            s3 = boto3.Session().resource(
-                's3',
-                aws_access_key_id=creds["AccessKeyId"],
-                aws_secret_access_key=creds["SecretAccessKey"],
-                aws_session_token=creds["SessionToken"],
-                config=config,
+        endpoint_env, region_env, addressing_style_env = S3Utils._resolve_client_env_overrides()
+        endpoint_url = endpoint_cfg or endpoint_env
+        region_name = region_cfg or region_env
+
+        if endpoint_url and 'signature_version' not in cfg_kwargs:
+            cfg_kwargs['signature_version'] = 's3v4'
+
+        if addressing_style_env and 'addressing_style' not in s3_cfg:
+            s3_cfg['addressing_style'] = addressing_style_env
+        elif endpoint_url and 'addressing_style' not in s3_cfg:
+            # Most TOS endpoints work reliably with virtual-hosted style.
+            s3_cfg['addressing_style'] = 'virtual'
+
+        if s3_cfg:
+            cfg_kwargs['s3'] = s3_cfg
+
+        config_obj = botocore.config.Config(**cfg_kwargs)
+
+        use_cache = session is None
+        cache = getattr(S3Utils._RESOURCE_CACHE_LOCAL, 'cache', None)
+        if use_cache and cache is None:
+            cache = {}
+            S3Utils._RESOURCE_CACHE_LOCAL.cache = cache
+
+        cache_key = None
+        ttl_sec = S3Utils._get_client_cache_ttl_sec()
+        if use_cache:
+            cache_key = S3Utils._make_cache_key(
+                profile=profile,
+                creds=creds,
+                get_client=get_client,
+                endpoint_url=endpoint_url,
+                region_name=region_name,
+                config=cfg_kwargs,
             )
-        else:
-            s3 = (
-                boto3.Session().resource('s3', config=config) if not session else session.resource('s3', config=config)
-            )
+            if refresh:
+                cache.pop(cache_key, None)
 
-        if get_client:
-            return s3.meta.client
-        else:
-            return s3
+            entry = cache.get(cache_key)
+            if entry is not None:
+                created_ts = entry.get('created_ts', 0.0)
+                if ttl_sec == 0 or (time.monotonic() - created_ts) <= ttl_sec:
+                    return entry['obj']
+                cache.pop(cache_key, None)
+
+        s3 = S3Utils._build_resource(
+            profile=profile,
+            creds=creds,
+            session=session,
+            config_obj=config_obj,
+            endpoint_url=endpoint_url,
+            region_name=region_name,
+        )
+
+        obj = s3.meta.client if get_client else s3
+
+        if use_cache and cache_key is not None:
+            cache[cache_key] = {'created_ts': time.monotonic(), 'obj': obj}
+
+        return obj
 
     @staticmethod
     def parse_s3_url(s3_url: str) -> Optional[Tuple[str, str]]:

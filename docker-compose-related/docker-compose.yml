@@ -24,6 +24,24 @@ services:
 
     environment:
       - CUDA_VISIBLE_DEVICES=0,1,2,3,4,5,6,7
+      - RAMOSNEMO_SOURCE_DIR=/opt/ramosnemo_source
+      - RAMOSNEMO_EXTRAS=asr,audio
+      - RAMOSNEMO_DEFAULT_PIP_PACKAGES=boto3[crt] s3fs==0.4.2 tenacity tokenizers>=0.22.0,<=0.23.0 sentencepiece<1.0.0 polars>=1.6.0
+      - NEMO_S3_CACHE_DIR=/data2/mayufeng/.cache/nemo_s3
+      - NEMO_S3_CACHE_SIZE_GB=500
+      - NEMO_S3_DOWNLOAD_LOG_LEVEL=info
+      - TOS_ACCESS_KEY_ID=${TOS_ACCESS_KEY_ID:-}
+      - TOS_SECRET_ACCESS_KEY=${TOS_SECRET_ACCESS_KEY:-}
+      - TOS_REGION=${TOS_REGION:-}
+      - TOS_ENDPOINT=${TOS_ENDPOINT:-}
+      - TOS_SESSION_TOKEN=${TOS_SESSION_TOKEN:-}
+      - TOS_ADDRESSING_STYLE=${TOS_ADDRESSING_STYLE:-virtual}
+      - AWS_ACCESS_KEY_ID=${AWS_ACCESS_KEY_ID:-}
+      - AWS_SECRET_ACCESS_KEY=${AWS_SECRET_ACCESS_KEY:-}
+      - AWS_DEFAULT_REGION=${AWS_DEFAULT_REGION:-}
+      - AWS_ENDPOINT_URL=${AWS_ENDPOINT_URL:-}
+      - AWS_SESSION_TOKEN=${AWS_SESSION_TOKEN:-}
+      - AWS_S3_ADDRESSING_STYLE=${AWS_S3_ADDRESSING_STYLE:-}
     deploy:
       resources:
         reservations:
@@ -35,8 +53,6 @@ services:
       /bin/bash -c "
         echo 'Container started. Available GPUs:' &&
         nvidia-smi &&
-        echo '' &&
-        pip show polars >/dev/null 2>&1 || pip install --no-cache-dir 'polars>=1.6.0' &&
         echo '' &&
         /opt/setup_ramosnemo.sh &&
         echo '' &&

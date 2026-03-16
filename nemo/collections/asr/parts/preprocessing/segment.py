@@ -36,8 +36,10 @@
 import math
 import os
 import random
+import threading
 from io import BytesIO
 from pathlib import Path
+from queue import Full, Queue
 from typing import Iterable, List, Optional, Union
 
 import librosa
@@ -70,8 +72,66 @@ DEFAULT_S3_CACHE_SIZE_GB = 500
 S3_CACHE_DISABLE_ENV = 'NEMO_S3_CACHE_DISABLE'
 S3_CACHE_DIR_ENV = 'NEMO_S3_CACHE_DIR'
 S3_CACHE_SIZE_ENV = 'NEMO_S3_CACHE_SIZE_GB'
+S3_CACHE_ASYNC_WRITE_ENV = 'NEMO_S3_CACHE_ASYNC_WRITE'
+S3_CACHE_ASYNC_QUEUE_SIZE_ENV = 'NEMO_S3_CACHE_ASYNC_QUEUE_SIZE'
+DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE = 128
 _S3_CACHE_CONFIG = {'disable': None, 'cache_dir': None, 'size_gb': None}
 _S3_CACHE = None
+_S3_CACHE_WRITE_QUEUE = None
+_S3_CACHE_WRITE_WORKER = None
+
+
+def _s3_cache_async_enabled() -> bool:
+    return str(os.environ.get(S3_CACHE_ASYNC_WRITE_ENV, '1')).lower() in ('1', 'true', 'yes')
+
+
+def _get_s3_cache_write_queue() -> Queue:
+    global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER
+    if _S3_CACHE_WRITE_QUEUE is not None:
+        return _S3_CACHE_WRITE_QUEUE
+
+    raw_size = os.environ.get(S3_CACHE_ASYNC_QUEUE_SIZE_ENV, str(DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE))
+    try:
+        queue_size = int(raw_size)
+    except ValueError:
+        queue_size = DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE
+    queue_size = max(1, queue_size)
+
+    q: Queue = Queue(maxsize=queue_size)
+
+    def _worker():
+        while True:
+            item = q.get()
+            if item is None:
+                q.task_done()
+                return
+            cache, cache_key, cache_payload = item
+            try:
+                cache.set(cache_key, cache_payload)
+            except Exception as cache_error:
+                logging.debug(f'Async S3 cache write failed for {cache_key}: {cache_error}')
+            finally:
+                q.task_done()
+
+    t = threading.Thread(target=_worker, name='nemo-s3-cache-writer', daemon=True)
+    t.start()
+
+    _S3_CACHE_WRITE_QUEUE = q
+    _S3_CACHE_WRITE_WORKER = t
+    return q
+
+
+def _persist_to_s3_cache(cache, cache_key: str, cache_payload: bytes):
+    if not _s3_cache_async_enabled():
+        cache.set(cache_key, cache_payload)
+        return
+
+    q = _get_s3_cache_write_queue()
+    try:
+        q.put_nowait((cache, cache_key, cache_payload))
+    except Full:
+        # Drop cache writes when queue is saturated; never block sample loading.
+        logging.debug(f'Async S3 cache queue full, dropping cache write for {cache_key}')
 
 
 def _download_audio_from_s3(audio_path: str):
@@ -93,7 +153,8 @@ def _download_audio_from_s3(audio_path: str):
     stream = S3Utils.download_s3_file_to_stream(audio_path)
     if cache is not None:
         try:
-            cache.set(cache_key, stream.getbuffer().tobytes())
+            cache_payload = stream.getbuffer().tobytes()
+            _persist_to_s3_cache(cache, cache_key, cache_payload)
         except Exception as cache_error:
             logging.debug(f'Failed to persist {audio_path} into S3 disk cache: {cache_error}')
         stream.seek(0)
@@ -125,123 +186,6 @@ def _get_s3_cache():
         import diskcache
     except ModuleNotFoundError:
         logging.warning('diskcache is not installed; S3 disk caching is disabled.')
-        return None
-
-    cache_dir = _S3_CACHE_CONFIG.get('cache_dir')
-    if cache_dir is None:
-        cache_dir = os.environ.get(S3_CACHE_DIR_ENV, Path.home() / '.cache' / 'nemo' / 's3')
-    cache_dir = Path(cache_dir)
-
-    size_cfg = _S3_CACHE_CONFIG.get('size_gb')
-    size_env = os.environ.get(S3_CACHE_SIZE_ENV)
-    try:
-        size_gb = int(size_cfg) if size_cfg is not None else int(size_env) if size_env else DEFAULT_S3_CACHE_SIZE_GB
-    except ValueError:
-        logging.warning(
-            f'Invalid {S3_CACHE_SIZE_ENV} value {size_env}; falling back to default {DEFAULT_S3_CACHE_SIZE_GB}GB.'
-        )
-        size_gb = DEFAULT_S3_CACHE_SIZE_GB
-    size_limit_bytes = size_gb * (1024**3)
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _S3_CACHE = diskcache.Cache(
-        directory=str(cache_dir), size_limit=size_limit_bytes, eviction_policy='least-recently-used'
-    )
-    return _S3_CACHE
-
-
-def configure_s3_cache(cache_dir: Optional[Union[str, Path]] = None, size_gb: Optional[int] = None, disable=None):
-    """
-    Configure the S3 disk cache programmatically. Subsequent downloads will use this configuration.
-    If called after the cache has been created, the cache will be closed and re-created on next use.
-    """
-    global _S3_CACHE_CONFIG, _S3_CACHE
-    new_config = {'disable': disable, 'cache_dir': cache_dir, 'size_gb': size_gb}
-    if _S3_CACHE_CONFIG == new_config:
-        return
-
-    if _S3_CACHE is not None:
-        try:
-            _S3_CACHE.close()
-        except Exception as cache_error:
-            logging.debug(f'Failed to close existing S3 cache: {cache_error}')
-    _S3_CACHE = None
-    _S3_CACHE_CONFIG = new_config
-
-
-def _prepare_audio_source(audio_reference):
-    """Return a tuple of (object to read audio from, original path if available, lowercase suffix)."""
-
-    audio_obj = audio_reference
-    audio_path = None
-
-    if isinstance(audio_reference, os.PathLike):
-        audio_reference = os.fspath(audio_reference)
-        audio_obj = audio_reference
-
-    if isinstance(audio_reference, str):
-        audio_path = audio_reference
-        if is_s3_url(audio_reference):
-            audio_obj = _download_audio_from_s3(audio_reference)
-    else:
-        audio_path = getattr(audio_reference, 'name', None)
-
-    audio_suffix = os.path.splitext(audio_path)[-1].lower() if audio_path else ''
-
-    return audio_obj, audio_path, audio_suffix
-
-
-def _download_audio_from_s3(audio_path: str):
-    try:
-        from nemo.utils.s3_utils import S3Utils
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Reading audio files from s3:// paths requires the optional S3 dependencies (boto3[crt], "
-            "s3fs==0.4.2, tenacity). Please install them as documented in docs/source/common/s3_checkpointing.rst."
-        ) from exc
-
-    cache = _get_s3_cache()
-    cache_key = audio_path
-    if cache is not None:
-        cached_bytes = cache.get(cache_key, default=None)
-        if cached_bytes is not None:
-            return BytesIO(cached_bytes)
-
-    stream = S3Utils.download_s3_file_to_stream(audio_path)
-    if cache is not None:
-        try:
-            cache.set(cache_key, stream.getbuffer().tobytes())
-        except Exception as cache_error:
-            logging.debug(f'Failed to persist {audio_path} into S3 disk cache: {cache_error}')
-        stream.seek(0)
-
-    return stream
-
-
-def _get_s3_cache():
-    """
-    Returns a disk-backed cache for S3 objects if diskcache is available.
-    Cache size is controlled via NEMO_S3_CACHE_SIZE_GB (default 500GB),
-    NEMO_S3_CACHE_DIR, and can be disabled with NEMO_S3_CACHE_DISABLE.
-    """
-    global _S3_CACHE
-    if _S3_CACHE is not None:
-        return _S3_CACHE
-
-    disable_config = _S3_CACHE_CONFIG.get('disable')
-    disable_env = str(os.environ.get(S3_CACHE_DISABLE_ENV, '0')).lower() in ('1', 'true', 'yes')
-    if disable_config is None:
-        disable_flag = disable_env
-    else:
-        disable_flag = disable_config
-
-    if disable_flag:
-        return None
-
-    try:
-        import diskcache
-    except ModuleNotFoundError:
-        logging.debug('diskcache is not installed; S3 disk caching is disabled.')
         return None
 
     cache_dir = _S3_CACHE_CONFIG.get('cache_dir')
