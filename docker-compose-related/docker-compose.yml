@@ -17,6 +17,7 @@ services:
       - /data2:/data2
       - /data3:/data3
       - /mnt/asr-audio-data:/mnt/asr-audio-data
+      - /mnt/asr-audio-roufo:/mnt/asr-audio-roufo
       - ../logs:/workspace/logs
 
       # RamosNeMo 源码目录 - 使用本地 entrance 脚本

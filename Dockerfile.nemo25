@@ -1,8 +1,21 @@
 FROM nvcr.io/nvidia/nemo:25.11
 SHELL ["/bin/bash", "-lc"]
 
+ARG UBUNTU_MIRROR=https://mirrors.aliyun.com/ubuntu
+ARG UBUNTU_SECURITY_MIRROR=https://mirrors.aliyun.com/ubuntu
+
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && \
+RUN set -eux; \
+    for apt_source in /etc/apt/sources.list /etc/apt/sources.list.d/*.list /etc/apt/sources.list.d/*.sources; do \
+      [ -e "${apt_source}" ] || continue; \
+      sed -i \
+        -e "s|http://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+        -e "s|https://archive.ubuntu.com/ubuntu|${UBUNTU_MIRROR}|g" \
+        -e "s|http://security.ubuntu.com/ubuntu|${UBUNTU_SECURITY_MIRROR}|g" \
+        -e "s|https://security.ubuntu.com/ubuntu|${UBUNTU_SECURITY_MIRROR}|g" \
+        "${apt_source}"; \
+    done; \
+    apt-get update -o Acquire::Retries=3 && \
     apt-get install -y --no-install-recommends \
       ffmpeg \
       git \
