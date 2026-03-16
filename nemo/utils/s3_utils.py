@@ -53,6 +53,7 @@ DEFAULT_CLIENT_CACHE_TTL_SEC = 30 * 60
 
 _ENDPOINT_URL_ENV_KEYS = ('AWS_ENDPOINT_URL', 'TOS_ENDPOINT', 'TOS_ENDPOINT_URL')
 _REGION_ENV_KEYS = ('AWS_DEFAULT_REGION', 'TOS_REGION')
+_ADDRESSING_STYLE_ENV_KEYS = ('AWS_S3_ADDRESSING_STYLE', 'TOS_ADDRESSING_STYLE')
 
 
 class S3Utils:
@@ -261,9 +262,13 @@ class S3Utils:
                 region_name = value
                 break
 
-        addressing_style = (os.environ.get('TOS_ADDRESSING_STYLE') or '').strip().lower()
-        if addressing_style not in {'virtual', 'path'}:
-            addressing_style = None
+        valid_addressing_styles = {'virtual', 'path'}
+        addressing_style = None
+        for key in _ADDRESSING_STYLE_ENV_KEYS:
+            value = (os.environ.get(key) or '').strip().lower()
+            if value in valid_addressing_styles:
+                addressing_style = value
+                break
 
         return endpoint_url, region_name, addressing_style
 
