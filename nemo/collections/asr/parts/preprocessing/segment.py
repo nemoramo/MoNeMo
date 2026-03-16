@@ -40,7 +40,7 @@ import threading
 from io import BytesIO
 from pathlib import Path
 from queue import Full, Queue
-from typing import Iterable, List, Optional, Union
+from typing import Iterable, List, Optional, Tuple, Union
 
 import librosa
 import numpy as np
@@ -75,10 +75,13 @@ S3_CACHE_SIZE_ENV = 'NEMO_S3_CACHE_SIZE_GB'
 S3_CACHE_ASYNC_WRITE_ENV = 'NEMO_S3_CACHE_ASYNC_WRITE'
 S3_CACHE_ASYNC_QUEUE_SIZE_ENV = 'NEMO_S3_CACHE_ASYNC_QUEUE_SIZE'
 DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE = 128
+LOCAL_AUDIO_PREFIX_MAP_ENV = 'NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP'
 _S3_CACHE_CONFIG = {'disable': None, 'cache_dir': None, 'size_gb': None}
 _S3_CACHE = None
 _S3_CACHE_WRITE_QUEUE = None
 _S3_CACHE_WRITE_WORKER = None
+_LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW = None
+_LOCAL_AUDIO_PREFIX_MAP_CACHE: List[Tuple[str, str]] = []
 
 
 def _s3_cache_async_enabled() -> bool:
@@ -132,6 +135,77 @@ def _persist_to_s3_cache(cache, cache_key: str, cache_payload: bytes):
     except Full:
         # Drop cache writes when queue is saturated; never block sample loading.
         logging.debug(f'Async S3 cache queue full, dropping cache write for {cache_key}')
+
+
+def _get_local_audio_prefix_mappings() -> List[Tuple[str, str]]:
+    """
+    Parse optional URI/local prefix mappings from env.
+
+    Format: "remote_prefix=local_prefix,remote_prefix2=local_prefix2"
+    Example: "tos://=/mnt/,s3://asr-audio-data/=/mnt/asr-audio-data/"
+    """
+    global _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW, _LOCAL_AUDIO_PREFIX_MAP_CACHE
+
+    raw_mapping = (os.environ.get(LOCAL_AUDIO_PREFIX_MAP_ENV, '') or '').strip()
+    if raw_mapping == _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW:
+        return _LOCAL_AUDIO_PREFIX_MAP_CACHE
+
+    parsed: List[Tuple[str, str]] = []
+    for entry in raw_mapping.replace(';', ',').split(','):
+        item = entry.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            logging.warning(
+                f"Ignoring invalid {LOCAL_AUDIO_PREFIX_MAP_ENV} entry without '=': {item!r}. "
+                "Expected format: remote_prefix=local_prefix"
+            )
+            continue
+        remote_prefix, local_prefix = item.split('=', 1)
+        remote_prefix = remote_prefix.strip()
+        local_prefix = local_prefix.strip()
+        if not remote_prefix or not local_prefix:
+            logging.warning(
+                f"Ignoring invalid {LOCAL_AUDIO_PREFIX_MAP_ENV} entry with empty prefix: {item!r}. "
+                "Expected format: remote_prefix=local_prefix"
+            )
+            continue
+        parsed.append((remote_prefix, local_prefix))
+
+    _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW = raw_mapping
+    _LOCAL_AUDIO_PREFIX_MAP_CACHE = parsed
+    return _LOCAL_AUDIO_PREFIX_MAP_CACHE
+
+
+def _resolve_local_audio_fallback_path(audio_path: str) -> Optional[str]:
+    """
+    Resolve a remote URI to local mounted path by prefix replacement.
+    Uses mapping from NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP and only returns
+    the local path when the file exists.
+    """
+    mappings = _get_local_audio_prefix_mappings()
+    if not mappings:
+        return None
+
+    for remote_prefix, local_prefix in mappings:
+        if not audio_path.startswith(remote_prefix):
+            continue
+        suffix = audio_path[len(remote_prefix) :]
+        local_candidate = os.path.expanduser(f"{local_prefix}{suffix}")
+        if os.path.exists(local_candidate):
+            return local_candidate
+        logging.debug(
+            f"Local fallback candidate missing for {audio_path}: {local_candidate}. "
+            "Will continue with remote fetch."
+        )
+    return None
+
+
+def _normalize_remote_audio_uri(audio_path: str) -> str:
+    # Accept tos:// URIs and route them via the S3-compatible reader.
+    if audio_path.startswith('tos://'):
+        return f"s3://{audio_path[len('tos://'):]}"
+    return audio_path
 
 
 def _download_audio_from_s3(audio_path: str):
@@ -242,8 +316,18 @@ def _prepare_audio_source(audio_reference):
 
     if isinstance(audio_reference, str):
         audio_path = audio_reference
-        if is_s3_url(audio_reference):
-            audio_obj = _download_audio_from_s3(audio_reference)
+
+        # 1) Prefer mounted local fallback if configured and present.
+        local_fallback = _resolve_local_audio_fallback_path(audio_reference)
+        if local_fallback is not None:
+            audio_obj = local_fallback
+            audio_path = local_fallback
+        else:
+            # 2) Otherwise, normalize URI scheme and perform remote fetch when applicable.
+            remote_audio_path = _normalize_remote_audio_uri(audio_reference)
+            audio_path = remote_audio_path
+            if is_s3_url(remote_audio_path):
+                audio_obj = _download_audio_from_s3(remote_audio_path)
     else:
         audio_path = getattr(audio_reference, 'name', None)
 

@@ -28,6 +28,7 @@ services:
       - RAMOSNEMO_EXTRAS=asr,audio
       - RAMOSNEMO_DEFAULT_PIP_PACKAGES=boto3[crt] s3fs==0.4.2 tenacity tokenizers>=0.22.0,<=0.23.0 sentencepiece<1.0.0 polars>=1.6.0
       - NEMO_S3_CACHE_DISABLE=${NEMO_S3_CACHE_DISABLE:-1}
+      - NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP=${NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP:-tos://=/mnt/}
       - NEMO_S3_DOWNLOAD_LOG_LEVEL=info
       - TOS_ACCESS_KEY_ID=${TOS_ACCESS_KEY_ID:-}
       - TOS_SECRET_ACCESS_KEY=${TOS_SECRET_ACCESS_KEY:-}

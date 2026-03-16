@@ -68,6 +68,8 @@ python /opt/ramosnemo_source/examples/asr/asr_ctc/speech_to_text_ctc_bpe.py \
 - `docker-compose.yml` 会把 `TOS_*` 和 `AWS_*` 环境注入容器，`setup_ramosnemo.sh` 会自动做 `TOS_* -> AWS_*` 兼容映射。
 - 默认关闭音频 S3/TOS 本地缓存（`NEMO_S3_CACHE_DISABLE=1`）。
 - 若要开启缓存：设置 `NEMO_S3_CACHE_DISABLE=0`，并按需设置 `NEMO_S3_CACHE_DIR`、`NEMO_S3_CACHE_SIZE_GB`。
+- 支持前缀映射本地兜底读取：`NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP`，默认 `tos://=/mnt/`。
+- 映射命中且本地文件存在时优先读本地；不存在时自动回退到远端（S3/TOS）读取。
 - 新增示例配置：`examples/asr/conf/fastconformer/fast-conformer_ctc_bpe_110m_en_ar_tos.yaml`。
 
 ## entrance.py 运行示例（Hybrid RNNT+CTC）
