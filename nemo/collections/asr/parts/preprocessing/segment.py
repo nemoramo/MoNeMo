@@ -33,6 +33,7 @@
 # SOFTWARE.
 # This file contains code artifacts adapted from https://github.com/ryanleary/patter
 
+import atexit
 import math
 import os
 import random
@@ -80,8 +81,34 @@ _S3_CACHE_CONFIG = {'disable': None, 'cache_dir': None, 'size_gb': None}
 _S3_CACHE = None
 _S3_CACHE_WRITE_QUEUE = None
 _S3_CACHE_WRITE_WORKER = None
+_S3_CACHE_WRITE_LOCK = threading.Lock()
+_S3_CACHE_WRITE_SHUTDOWN_REGISTERED = False
 _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW = None
 _LOCAL_AUDIO_PREFIX_MAP_CACHE: List[Tuple[str, str]] = []
+
+
+def _shutdown_s3_cache_write_worker():
+    global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER
+
+    q = _S3_CACHE_WRITE_QUEUE
+    t = _S3_CACHE_WRITE_WORKER
+    if q is None or t is None:
+        return
+
+    try:
+        q.put(None, timeout=0.5)
+    except Full:
+        logging.debug('Async S3 cache writer queue full during shutdown; skipping graceful stop signal.')
+    except Exception as shutdown_error:
+        logging.debug(f'Failed to signal async S3 cache writer shutdown: {shutdown_error}')
+
+    try:
+        t.join(timeout=1.0)
+    except Exception as join_error:
+        logging.debug(f'Failed to join async S3 cache writer thread: {join_error}')
+
+    _S3_CACHE_WRITE_QUEUE = None
+    _S3_CACHE_WRITE_WORKER = None
 
 
 def _s3_cache_async_enabled() -> bool:
@@ -89,39 +116,46 @@ def _s3_cache_async_enabled() -> bool:
 
 
 def _get_s3_cache_write_queue() -> Queue:
-    global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER
+    global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER, _S3_CACHE_WRITE_SHUTDOWN_REGISTERED
     if _S3_CACHE_WRITE_QUEUE is not None:
         return _S3_CACHE_WRITE_QUEUE
 
-    raw_size = os.environ.get(S3_CACHE_ASYNC_QUEUE_SIZE_ENV, str(DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE))
-    try:
-        queue_size = int(raw_size)
-    except ValueError:
-        queue_size = DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE
-    queue_size = max(1, queue_size)
+    with _S3_CACHE_WRITE_LOCK:
+        if _S3_CACHE_WRITE_QUEUE is not None:
+            return _S3_CACHE_WRITE_QUEUE
 
-    q: Queue = Queue(maxsize=queue_size)
+        raw_size = os.environ.get(S3_CACHE_ASYNC_QUEUE_SIZE_ENV, str(DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE))
+        try:
+            queue_size = int(raw_size)
+        except ValueError:
+            queue_size = DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE
+        queue_size = max(1, queue_size)
 
-    def _worker():
-        while True:
-            item = q.get()
-            if item is None:
-                q.task_done()
-                return
-            cache, cache_key, cache_payload = item
-            try:
-                cache.set(cache_key, cache_payload)
-            except Exception as cache_error:
-                logging.debug(f'Async S3 cache write failed for {cache_key}: {cache_error}')
-            finally:
-                q.task_done()
+        q: Queue = Queue(maxsize=queue_size)
 
-    t = threading.Thread(target=_worker, name='nemo-s3-cache-writer', daemon=True)
-    t.start()
+        def _worker():
+            while True:
+                item = q.get()
+                if item is None:
+                    q.task_done()
+                    return
+                cache, cache_key, cache_payload = item
+                try:
+                    cache.set(cache_key, cache_payload)
+                except Exception as cache_error:
+                    logging.debug(f'Async S3 cache write failed for {cache_key}: {cache_error}')
+                finally:
+                    q.task_done()
 
-    _S3_CACHE_WRITE_QUEUE = q
-    _S3_CACHE_WRITE_WORKER = t
-    return q
+        t = threading.Thread(target=_worker, name='nemo-s3-cache-writer', daemon=True)
+        t.start()
+
+        _S3_CACHE_WRITE_QUEUE = q
+        _S3_CACHE_WRITE_WORKER = t
+        if not _S3_CACHE_WRITE_SHUTDOWN_REGISTERED:
+            atexit.register(_shutdown_s3_cache_write_worker)
+            _S3_CACHE_WRITE_SHUTDOWN_REGISTERED = True
+        return _S3_CACHE_WRITE_QUEUE
 
 
 def _persist_to_s3_cache(cache, cache_key: str, cache_payload: bytes):
