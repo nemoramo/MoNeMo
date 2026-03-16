@@ -66,7 +66,34 @@ python /opt/ramosnemo_source/examples/asr/asr_ctc/speech_to_text_ctc_bpe.py \
 
 说明：
 - `docker-compose.yml` 会把 `TOS_*` 和 `AWS_*` 环境注入容器，`setup_ramosnemo.sh` 会自动做 `TOS_* -> AWS_*` 兼容映射。
+- 默认关闭音频 S3/TOS 本地缓存（`NEMO_S3_CACHE_DISABLE=1`）。
+- 若要开启缓存：设置 `NEMO_S3_CACHE_DISABLE=0`，并按需设置 `NEMO_S3_CACHE_DIR`、`NEMO_S3_CACHE_SIZE_GB`。
 - 新增示例配置：`examples/asr/conf/fastconformer/fast-conformer_ctc_bpe_110m_en_ar_tos.yaml`。
+
+## entrance.py 运行示例（Hybrid RNNT+CTC）
+如果你希望复用 `entrance_kit/local/entrance.py`（对齐 SageMaker 启动方式），可在容器内这样执行：
+```bash
+docker compose --env-file "${ENV_FILE}" -f docker-compose.yml exec -it nemo-training bash -lc '
+python /opt/ramosnemo_source/entrance_kit/local/entrance.py \
+  --config-name fastconformer_hybrid_tdt_ctc_bpe_110m \
+  --train-manifest /data2/<user>/manifests/train.jsonl \
+  --val-manifest /data2/<user>/manifests/val.jsonl \
+  --tokenizer-dir /data2/<user>/tokenizers/en_ar_bpe \
+  --pretrained /data2/<user>/models/parakeet-tdt_ctc-110m.nemo \
+  --out /data2/<user>/nemo_exps/en_ar_hybrid \
+  --run-name en_ar_hybrid \
+  --devices 4 --precision bf16 \
+  --train-bsz 96 --val-bsz 96 \
+  --num-workers 8 \
+  --max-epochs 15 \
+  --val-check-interval 2000 \
+  --ckpt-every-steps 2000
+'
+```
+
+说明：
+- `entrance.py` 当前默认走 hybrid 训练入口（RNNT+CTC）。
+- 如果要纯 CTC 训练，使用上面 `speech_to_text_ctc_bpe.py` + `fast-conformer_ctc_bpe_110m_en_ar_tos.yaml` 的示例。
 
 ## 挂载与依赖
 - `/data1`, `/data2` 挂载到容器内同路径；`../RamosNeMo` 挂载到 `/opt/ramosnemo_source`。  
