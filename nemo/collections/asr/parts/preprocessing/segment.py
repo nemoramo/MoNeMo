@@ -79,6 +79,7 @@ DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE = 128
 LOCAL_AUDIO_PREFIX_MAP_ENV = 'NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP'
 _S3_CACHE_CONFIG = {'disable': None, 'cache_dir': None, 'size_gb': None}
 _S3_CACHE = None
+_S3_CACHE_BACKEND_AVAILABLE = None
 _S3_CACHE_WRITE_QUEUE = None
 _S3_CACHE_WRITE_WORKER = None
 _S3_CACHE_WRITE_LOCK = threading.Lock()
@@ -276,7 +277,7 @@ def _get_s3_cache():
     Cache size is controlled via NEMO_S3_CACHE_SIZE_GB (default 500GB),
     NEMO_S3_CACHE_DIR, and can be disabled with NEMO_S3_CACHE_DISABLE.
     """
-    global _S3_CACHE
+    global _S3_CACHE, _S3_CACHE_BACKEND_AVAILABLE
     if _S3_CACHE is not None:
         return _S3_CACHE
 
@@ -290,11 +291,17 @@ def _get_s3_cache():
     if disable_flag:
         return None
 
+    if _S3_CACHE_BACKEND_AVAILABLE is False:
+        return None
+
     try:
         import diskcache
     except ModuleNotFoundError:
+        _S3_CACHE_BACKEND_AVAILABLE = False
         logging.warning('diskcache is not installed; S3 disk caching is disabled.')
         return None
+
+    _S3_CACHE_BACKEND_AVAILABLE = True
 
     cache_dir = _S3_CACHE_CONFIG.get('cache_dir')
     if cache_dir is None:
