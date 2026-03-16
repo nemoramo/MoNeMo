@@ -123,6 +123,7 @@ celerybeat-schedule
 # Environments
 .env
 .venv
+.worktrees/
 env/
 venv/
 ENV/
