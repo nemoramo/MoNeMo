@@ -38,6 +38,7 @@ import math
 import os
 import random
 import threading
+import time
 from io import BytesIO
 from pathlib import Path
 from queue import Full, Queue
@@ -88,28 +89,54 @@ _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW = None
 _LOCAL_AUDIO_PREFIX_MAP_CACHE: List[Tuple[str, str]] = []
 
 
-def _shutdown_s3_cache_write_worker():
+def _wait_for_s3_cache_write_queue_drain(q: Queue, timeout_sec: float) -> bool:
+    if timeout_sec <= 0:
+        return getattr(q, 'unfinished_tasks', 0) == 0
+
+    deadline = time.monotonic() + timeout_sec
+    all_tasks_done = getattr(q, 'all_tasks_done', None)
+    if all_tasks_done is None:
+        while getattr(q, 'unfinished_tasks', 0) > 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return getattr(q, 'unfinished_tasks', 0) == 0
+
+    with all_tasks_done:
+        while getattr(q, 'unfinished_tasks', 0) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            all_tasks_done.wait(timeout=min(0.25, remaining))
+    return getattr(q, 'unfinished_tasks', 0) == 0
+
+
+def _shutdown_s3_cache_write_worker(*, drain: bool = False, timeout_sec: float = 2.0):
     global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER
 
-    q = _S3_CACHE_WRITE_QUEUE
-    t = _S3_CACHE_WRITE_WORKER
+    with _S3_CACHE_WRITE_LOCK:
+        q = _S3_CACHE_WRITE_QUEUE
+        t = _S3_CACHE_WRITE_WORKER
+        _S3_CACHE_WRITE_QUEUE = None
+        _S3_CACHE_WRITE_WORKER = None
+
     if q is None or t is None:
         return
 
     try:
-        q.put(None, timeout=0.5)
+        q.put(None, timeout=0.5 if not drain else min(2.0, timeout_sec))
     except Full:
         logging.debug('Async S3 cache writer queue full during shutdown; skipping graceful stop signal.')
     except Exception as shutdown_error:
         logging.debug(f'Failed to signal async S3 cache writer shutdown: {shutdown_error}')
 
+    if drain:
+        drained = _wait_for_s3_cache_write_queue_drain(q, timeout_sec=timeout_sec)
+        if not drained:
+            logging.debug('Timed out while draining async S3 cache writer queue during shutdown.')
+
     try:
-        t.join(timeout=1.0)
+        t.join(timeout=max(1.0, timeout_sec))
     except Exception as join_error:
         logging.debug(f'Failed to join async S3 cache writer thread: {join_error}')
-
-    _S3_CACHE_WRITE_QUEUE = None
-    _S3_CACHE_WRITE_WORKER = None
 
 
 def _s3_cache_async_enabled() -> bool:
@@ -335,6 +362,9 @@ def configure_s3_cache(cache_dir: Optional[Union[str, Path]] = None, size_gb: Op
     new_config = {'disable': disable, 'cache_dir': cache_dir, 'size_gb': size_gb}
     if _S3_CACHE_CONFIG == new_config:
         return
+
+    # Stop and drain async writer queue so it won't write into a soon-to-be-closed cache object.
+    _shutdown_s3_cache_write_worker(drain=True)
 
     if _S3_CACHE is not None:
         try:
