@@ -6,11 +6,46 @@ FALLBACK_DIR="/workspace/RamosNeMo"
 EXTRAS="${RAMOSNEMO_EXTRAS:-asr,audio}"
 DEFAULT_PIP_PACKAGES="${RAMOSNEMO_DEFAULT_PIP_PACKAGES:-boto3[crt] s3fs==0.4.2 tenacity tokenizers>=0.22.0,<=0.23.0 sentencepiece<1.0.0 polars>=1.6.0}"
 EXTRA_PIP_PACKAGES="${RAMOSNEMO_PIP_PACKAGES:-}"
+INSTALL_RUNTIME_PACKAGES="${RAMOSNEMO_INSTALL_RUNTIME_PACKAGES:-0}"
+RUNTIME_INSTALL_MODE="${RAMOSNEMO_RUNTIME_PACKAGE_INSTALL_MODE:-missing}"
+
+is_truthy() {
+  local value="${1:-}"
+  value="${value,,}"
+  [[ "${value}" == "1" || "${value}" == "true" || "${value}" == "yes" || "${value}" == "on" ]]
+}
+
+extract_dist_name() {
+  local spec="$1"
+  local dist_name="${spec%%[<>=!~;[:space:]]*}"
+  dist_name="${dist_name%%\[*}"
+  printf '%s' "${dist_name}"
+}
+
+is_dist_installed() {
+  local dist_name="$1"
+  python - "$dist_name" <<'PY'
+import sys
+from importlib.metadata import PackageNotFoundError, version
+
+name = sys.argv[1]
+try:
+    version(name)
+except PackageNotFoundError:
+    raise SystemExit(1)
+except Exception:
+    raise SystemExit(1)
+raise SystemExit(0)
+PY
+}
 
 install_runtime_packages() {
   local package_string="$1"
   local label="$2"
+  local mode="$3"
+  local dist_name=""
   local -a packages=()
+  local -a install_list=()
 
   if [[ -z "${package_string//[[:space:]]/}" ]]; then
     return
@@ -18,8 +53,31 @@ install_runtime_packages() {
 
   # Split by shell words so requirement specs stay intact (e.g., tokenizers>=0.22.0,<=0.23.0).
   read -r -a packages <<< "${package_string}"
-  echo "${label}: ${package_string}"
-  python -m pip install --no-cache-dir "${packages[@]}"
+
+  if [[ "${mode}" == "all" ]]; then
+    install_list=("${packages[@]}")
+  else
+    for package_spec in "${packages[@]}"; do
+      dist_name="$(extract_dist_name "${package_spec}")"
+      if [[ -z "${dist_name}" ]]; then
+        install_list+=("${package_spec}")
+        continue
+      fi
+      if is_dist_installed "${dist_name}"; then
+        echo "Runtime package already installed, skip: ${package_spec}"
+      else
+        install_list+=("${package_spec}")
+      fi
+    done
+  fi
+
+  if [[ "${#install_list[@]}" -eq 0 ]]; then
+    echo "${label}: all packages already available, nothing to install"
+    return
+  fi
+
+  echo "${label}: installing ${install_list[*]}"
+  python -m pip install --no-cache-dir "${install_list[@]}"
 }
 
 if [[ -z "${AWS_ACCESS_KEY_ID:-}" && -n "${TOS_ACCESS_KEY_ID:-}" ]]; then
@@ -59,5 +117,15 @@ else
   python -m pip install -e "${install_dir}"
 fi
 
-install_runtime_packages "${DEFAULT_PIP_PACKAGES}" "Ensuring default runtime packages"
-install_runtime_packages "${EXTRA_PIP_PACKAGES}" "Installing extra runtime packages"
+runtime_mode="${RUNTIME_INSTALL_MODE,,}"
+if [[ "${runtime_mode}" != "all" && "${runtime_mode}" != "missing" ]]; then
+  echo "WARN: invalid RAMOSNEMO_RUNTIME_PACKAGE_INSTALL_MODE='${RUNTIME_INSTALL_MODE}', fallback to 'missing'" >&2
+  runtime_mode="missing"
+fi
+
+if is_truthy "${INSTALL_RUNTIME_PACKAGES}"; then
+  install_runtime_packages "${DEFAULT_PIP_PACKAGES}" "Ensuring default runtime packages" "${runtime_mode}"
+  install_runtime_packages "${EXTRA_PIP_PACKAGES}" "Installing extra runtime packages" "${runtime_mode}"
+else
+  echo "Skipping runtime package installation (set RAMOSNEMO_INSTALL_RUNTIME_PACKAGES=1 to enable)"
+fi

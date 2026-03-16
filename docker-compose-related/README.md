@@ -21,6 +21,7 @@ docker compose -f docker-compose.yml exec -it nemo-training bash
 - `docker-compose.yml` 默认使用仓库根目录的 `Dockerfile.nemo25` 构建镜像。
 - 如果你的环境只有 `docker-compose`，下面所有 `docker compose` 命令都可以等价替换为 `docker-compose`。
 - 容器启动时会执行 `/opt/setup_ramosnemo.sh`，默认安装 `pip install -e "/opt/ramosnemo_source[asr,audio]"`。
+- runtime pip 依赖默认不在启动时安装（`RAMOSNEMO_INSTALL_RUNTIME_PACKAGES=0`），避免每次启动产生环境漂移。
 - 如需关闭 extras，可在启动前设置 `RAMOSNEMO_EXTRAS=none`。
 
 ## 挂载目录
@@ -109,6 +110,8 @@ python scripts/gemini_nfa_pipeline.py \
 | `CUDA_VISIBLE_DEVICES` | 控制容器内可见 GPU | 当前 compose 默认为 `0,1,2,3,4,5,6,7` |
 | `RAMOSNEMO_EXTRAS` | 控制启动时 `pip install -e` 的 extras | 默认 `asr,audio`；若只想最小安装可设 `none` |
 | `RAMOSNEMO_SOURCE_DIR` | 指定源码目录 | 默认 `/opt/ramosnemo_source` |
+| `RAMOSNEMO_INSTALL_RUNTIME_PACKAGES` | 启动时是否安装 runtime pip 依赖 | 默认 `0`（关闭）；设为 `1` 才安装 |
+| `RAMOSNEMO_RUNTIME_PACKAGE_INSTALL_MODE` | runtime 依赖安装模式 | `missing`（默认，仅缺失时安装）或 `all`（每次安装） |
 
 ### NFA / `speech_related_tools` 层
 
@@ -186,6 +189,8 @@ python /opt/ramosnemo_source/examples/asr/asr_ctc/speech_to_text_ctc_bpe.py \
 
 说明：
 - `docker-compose.yml` 会把 `TOS_*` 和 `AWS_*` 环境注入容器，`setup_ramosnemo.sh` 会自动做 `TOS_* -> AWS_*` 兼容映射。
+- runtime pip 依赖默认关闭；如需启用，设 `RAMOSNEMO_INSTALL_RUNTIME_PACKAGES=1`。
+- runtime 安装模式默认 `missing`，仅在缺失时安装；可用 `RAMOSNEMO_RUNTIME_PACKAGE_INSTALL_MODE=all` 强制每次安装。
 - 默认关闭音频 S3/TOS 本地缓存（`NEMO_S3_CACHE_DISABLE=1`）。
 - 若要开启缓存：设置 `NEMO_S3_CACHE_DISABLE=0`，并按需设置 `NEMO_S3_CACHE_DIR`、`NEMO_S3_CACHE_SIZE_GB`。
 - 支持前缀映射本地兜底读取：`NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP`，默认 `tos://=/mnt/`。
