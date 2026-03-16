@@ -33,12 +33,16 @@
 # SOFTWARE.
 # This file contains code artifacts adapted from https://github.com/ryanleary/patter
 
+import atexit
 import math
 import os
 import random
+import threading
+import time
 from io import BytesIO
 from pathlib import Path
-from typing import Iterable, List, Optional, Union
+from queue import Full, Queue
+from typing import Iterable, List, Optional, Tuple, Union
 
 import librosa
 import numpy as np
@@ -70,8 +74,200 @@ DEFAULT_S3_CACHE_SIZE_GB = 500
 S3_CACHE_DISABLE_ENV = 'NEMO_S3_CACHE_DISABLE'
 S3_CACHE_DIR_ENV = 'NEMO_S3_CACHE_DIR'
 S3_CACHE_SIZE_ENV = 'NEMO_S3_CACHE_SIZE_GB'
+S3_CACHE_ASYNC_WRITE_ENV = 'NEMO_S3_CACHE_ASYNC_WRITE'
+S3_CACHE_ASYNC_QUEUE_SIZE_ENV = 'NEMO_S3_CACHE_ASYNC_QUEUE_SIZE'
+DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE = 128
+LOCAL_AUDIO_PREFIX_MAP_ENV = 'NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP'
 _S3_CACHE_CONFIG = {'disable': None, 'cache_dir': None, 'size_gb': None}
 _S3_CACHE = None
+_S3_CACHE_BACKEND_AVAILABLE = None
+_S3_CACHE_WRITE_QUEUE = None
+_S3_CACHE_WRITE_WORKER = None
+_S3_CACHE_WRITE_LOCK = threading.Lock()
+_S3_CACHE_WRITE_SHUTDOWN_REGISTERED = False
+_LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW = None
+_LOCAL_AUDIO_PREFIX_MAP_CACHE: List[Tuple[str, str]] = []
+
+
+def _wait_for_s3_cache_write_queue_drain(q: Queue, timeout_sec: float) -> bool:
+    if timeout_sec <= 0:
+        return getattr(q, 'unfinished_tasks', 0) == 0
+
+    deadline = time.monotonic() + timeout_sec
+    all_tasks_done = getattr(q, 'all_tasks_done', None)
+    if all_tasks_done is None:
+        while getattr(q, 'unfinished_tasks', 0) > 0 and time.monotonic() < deadline:
+            time.sleep(0.05)
+        return getattr(q, 'unfinished_tasks', 0) == 0
+
+    with all_tasks_done:
+        while getattr(q, 'unfinished_tasks', 0) > 0:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            all_tasks_done.wait(timeout=min(0.25, remaining))
+    return getattr(q, 'unfinished_tasks', 0) == 0
+
+
+def _shutdown_s3_cache_write_worker(*, drain: bool = False, timeout_sec: float = 2.0):
+    global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER
+
+    with _S3_CACHE_WRITE_LOCK:
+        q = _S3_CACHE_WRITE_QUEUE
+        t = _S3_CACHE_WRITE_WORKER
+        _S3_CACHE_WRITE_QUEUE = None
+        _S3_CACHE_WRITE_WORKER = None
+
+    if q is None or t is None:
+        return
+
+    try:
+        q.put(None, timeout=0.5 if not drain else min(2.0, timeout_sec))
+    except Full:
+        logging.debug('Async S3 cache writer queue full during shutdown; skipping graceful stop signal.')
+    except Exception as shutdown_error:
+        logging.debug(f'Failed to signal async S3 cache writer shutdown: {shutdown_error}')
+
+    if drain:
+        drained = _wait_for_s3_cache_write_queue_drain(q, timeout_sec=timeout_sec)
+        if not drained:
+            logging.debug('Timed out while draining async S3 cache writer queue during shutdown.')
+
+    try:
+        t.join(timeout=max(1.0, timeout_sec))
+    except Exception as join_error:
+        logging.debug(f'Failed to join async S3 cache writer thread: {join_error}')
+
+
+def _s3_cache_async_enabled() -> bool:
+    return str(os.environ.get(S3_CACHE_ASYNC_WRITE_ENV, '1')).lower() in ('1', 'true', 'yes')
+
+
+def _get_s3_cache_write_queue() -> Queue:
+    global _S3_CACHE_WRITE_QUEUE, _S3_CACHE_WRITE_WORKER, _S3_CACHE_WRITE_SHUTDOWN_REGISTERED
+    if _S3_CACHE_WRITE_QUEUE is not None:
+        return _S3_CACHE_WRITE_QUEUE
+
+    with _S3_CACHE_WRITE_LOCK:
+        if _S3_CACHE_WRITE_QUEUE is not None:
+            return _S3_CACHE_WRITE_QUEUE
+
+        raw_size = os.environ.get(S3_CACHE_ASYNC_QUEUE_SIZE_ENV, str(DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE))
+        try:
+            queue_size = int(raw_size)
+        except ValueError:
+            queue_size = DEFAULT_S3_CACHE_ASYNC_QUEUE_SIZE
+        queue_size = max(1, queue_size)
+
+        q: Queue = Queue(maxsize=queue_size)
+
+        def _worker():
+            while True:
+                item = q.get()
+                if item is None:
+                    q.task_done()
+                    return
+                cache, cache_key, cache_payload = item
+                try:
+                    cache.set(cache_key, cache_payload)
+                except Exception as cache_error:
+                    logging.debug(f'Async S3 cache write failed for {cache_key}: {cache_error}')
+                finally:
+                    q.task_done()
+
+        t = threading.Thread(target=_worker, name='nemo-s3-cache-writer', daemon=True)
+        t.start()
+
+        _S3_CACHE_WRITE_QUEUE = q
+        _S3_CACHE_WRITE_WORKER = t
+        if not _S3_CACHE_WRITE_SHUTDOWN_REGISTERED:
+            atexit.register(_shutdown_s3_cache_write_worker)
+            _S3_CACHE_WRITE_SHUTDOWN_REGISTERED = True
+        return _S3_CACHE_WRITE_QUEUE
+
+
+def _persist_to_s3_cache(cache, cache_key: str, cache_payload: bytes):
+    if not _s3_cache_async_enabled():
+        cache.set(cache_key, cache_payload)
+        return
+
+    q = _get_s3_cache_write_queue()
+    try:
+        q.put_nowait((cache, cache_key, cache_payload))
+    except Full:
+        # Drop cache writes when queue is saturated; never block sample loading.
+        logging.debug(f'Async S3 cache queue full, dropping cache write for {cache_key}')
+
+
+def _get_local_audio_prefix_mappings() -> List[Tuple[str, str]]:
+    """
+    Parse optional URI/local prefix mappings from env.
+
+    Format: "remote_prefix=local_prefix,remote_prefix2=local_prefix2"
+    Example: "tos://=/mnt/,s3://asr-audio-data/=/mnt/asr-audio-data/"
+    """
+    global _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW, _LOCAL_AUDIO_PREFIX_MAP_CACHE
+
+    raw_mapping = (os.environ.get(LOCAL_AUDIO_PREFIX_MAP_ENV, '') or '').strip()
+    if raw_mapping == _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW:
+        return _LOCAL_AUDIO_PREFIX_MAP_CACHE
+
+    parsed: List[Tuple[str, str]] = []
+    for entry in raw_mapping.replace(';', ',').split(','):
+        item = entry.strip()
+        if not item:
+            continue
+        if '=' not in item:
+            logging.warning(
+                f"Ignoring invalid {LOCAL_AUDIO_PREFIX_MAP_ENV} entry without '=': {item!r}. "
+                "Expected format: remote_prefix=local_prefix"
+            )
+            continue
+        remote_prefix, local_prefix = item.split('=', 1)
+        remote_prefix = remote_prefix.strip()
+        local_prefix = local_prefix.strip()
+        if not remote_prefix or not local_prefix:
+            logging.warning(
+                f"Ignoring invalid {LOCAL_AUDIO_PREFIX_MAP_ENV} entry with empty prefix: {item!r}. "
+                "Expected format: remote_prefix=local_prefix"
+            )
+            continue
+        parsed.append((remote_prefix, local_prefix))
+
+    _LOCAL_AUDIO_PREFIX_MAP_CACHE_RAW = raw_mapping
+    _LOCAL_AUDIO_PREFIX_MAP_CACHE = parsed
+    return _LOCAL_AUDIO_PREFIX_MAP_CACHE
+
+
+def _resolve_local_audio_fallback_path(audio_path: str) -> Optional[str]:
+    """
+    Resolve a remote URI to local mounted path by prefix replacement.
+    Uses mapping from NEMO_AUDIO_LOCAL_PATH_PREFIX_MAP and only returns
+    the local path when the file exists.
+    """
+    mappings = _get_local_audio_prefix_mappings()
+    if not mappings:
+        return None
+
+    for remote_prefix, local_prefix in mappings:
+        if not audio_path.startswith(remote_prefix):
+            continue
+        suffix = audio_path[len(remote_prefix) :]
+        local_candidate = os.path.expanduser(f"{local_prefix}{suffix}")
+        if os.path.exists(local_candidate):
+            return local_candidate
+        logging.debug(
+            f"Local fallback candidate missing for {audio_path}: {local_candidate}. "
+            "Will continue with remote fetch."
+        )
+    return None
+
+
+def _normalize_remote_audio_uri(audio_path: str) -> str:
+    # Accept tos:// URIs and route them via the S3-compatible reader.
+    if audio_path.startswith('tos://'):
+        return f"s3://{audio_path[len('tos://'):]}"
+    return audio_path
 
 
 def _download_audio_from_s3(audio_path: str):
@@ -93,7 +289,8 @@ def _download_audio_from_s3(audio_path: str):
     stream = S3Utils.download_s3_file_to_stream(audio_path)
     if cache is not None:
         try:
-            cache.set(cache_key, stream.getbuffer().tobytes())
+            cache_payload = stream.getbuffer().tobytes()
+            _persist_to_s3_cache(cache, cache_key, cache_payload)
         except Exception as cache_error:
             logging.debug(f'Failed to persist {audio_path} into S3 disk cache: {cache_error}')
         stream.seek(0)
@@ -107,7 +304,7 @@ def _get_s3_cache():
     Cache size is controlled via NEMO_S3_CACHE_SIZE_GB (default 500GB),
     NEMO_S3_CACHE_DIR, and can be disabled with NEMO_S3_CACHE_DISABLE.
     """
-    global _S3_CACHE
+    global _S3_CACHE, _S3_CACHE_BACKEND_AVAILABLE
     if _S3_CACHE is not None:
         return _S3_CACHE
 
@@ -121,128 +318,17 @@ def _get_s3_cache():
     if disable_flag:
         return None
 
+    if _S3_CACHE_BACKEND_AVAILABLE is False:
+        return None
+
     try:
         import diskcache
     except ModuleNotFoundError:
+        _S3_CACHE_BACKEND_AVAILABLE = False
         logging.warning('diskcache is not installed; S3 disk caching is disabled.')
         return None
 
-    cache_dir = _S3_CACHE_CONFIG.get('cache_dir')
-    if cache_dir is None:
-        cache_dir = os.environ.get(S3_CACHE_DIR_ENV, Path.home() / '.cache' / 'nemo' / 's3')
-    cache_dir = Path(cache_dir)
-
-    size_cfg = _S3_CACHE_CONFIG.get('size_gb')
-    size_env = os.environ.get(S3_CACHE_SIZE_ENV)
-    try:
-        size_gb = int(size_cfg) if size_cfg is not None else int(size_env) if size_env else DEFAULT_S3_CACHE_SIZE_GB
-    except ValueError:
-        logging.warning(
-            f'Invalid {S3_CACHE_SIZE_ENV} value {size_env}; falling back to default {DEFAULT_S3_CACHE_SIZE_GB}GB.'
-        )
-        size_gb = DEFAULT_S3_CACHE_SIZE_GB
-    size_limit_bytes = size_gb * (1024**3)
-
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    _S3_CACHE = diskcache.Cache(
-        directory=str(cache_dir), size_limit=size_limit_bytes, eviction_policy='least-recently-used'
-    )
-    return _S3_CACHE
-
-
-def configure_s3_cache(cache_dir: Optional[Union[str, Path]] = None, size_gb: Optional[int] = None, disable=None):
-    """
-    Configure the S3 disk cache programmatically. Subsequent downloads will use this configuration.
-    If called after the cache has been created, the cache will be closed and re-created on next use.
-    """
-    global _S3_CACHE_CONFIG, _S3_CACHE
-    new_config = {'disable': disable, 'cache_dir': cache_dir, 'size_gb': size_gb}
-    if _S3_CACHE_CONFIG == new_config:
-        return
-
-    if _S3_CACHE is not None:
-        try:
-            _S3_CACHE.close()
-        except Exception as cache_error:
-            logging.debug(f'Failed to close existing S3 cache: {cache_error}')
-    _S3_CACHE = None
-    _S3_CACHE_CONFIG = new_config
-
-
-def _prepare_audio_source(audio_reference):
-    """Return a tuple of (object to read audio from, original path if available, lowercase suffix)."""
-
-    audio_obj = audio_reference
-    audio_path = None
-
-    if isinstance(audio_reference, os.PathLike):
-        audio_reference = os.fspath(audio_reference)
-        audio_obj = audio_reference
-
-    if isinstance(audio_reference, str):
-        audio_path = audio_reference
-        if is_s3_url(audio_reference):
-            audio_obj = _download_audio_from_s3(audio_reference)
-    else:
-        audio_path = getattr(audio_reference, 'name', None)
-
-    audio_suffix = os.path.splitext(audio_path)[-1].lower() if audio_path else ''
-
-    return audio_obj, audio_path, audio_suffix
-
-
-def _download_audio_from_s3(audio_path: str):
-    try:
-        from nemo.utils.s3_utils import S3Utils
-    except ModuleNotFoundError as exc:
-        raise ModuleNotFoundError(
-            "Reading audio files from s3:// paths requires the optional S3 dependencies (boto3[crt], "
-            "s3fs==0.4.2, tenacity). Please install them as documented in docs/source/common/s3_checkpointing.rst."
-        ) from exc
-
-    cache = _get_s3_cache()
-    cache_key = audio_path
-    if cache is not None:
-        cached_bytes = cache.get(cache_key, default=None)
-        if cached_bytes is not None:
-            return BytesIO(cached_bytes)
-
-    stream = S3Utils.download_s3_file_to_stream(audio_path)
-    if cache is not None:
-        try:
-            cache.set(cache_key, stream.getbuffer().tobytes())
-        except Exception as cache_error:
-            logging.debug(f'Failed to persist {audio_path} into S3 disk cache: {cache_error}')
-        stream.seek(0)
-
-    return stream
-
-
-def _get_s3_cache():
-    """
-    Returns a disk-backed cache for S3 objects if diskcache is available.
-    Cache size is controlled via NEMO_S3_CACHE_SIZE_GB (default 500GB),
-    NEMO_S3_CACHE_DIR, and can be disabled with NEMO_S3_CACHE_DISABLE.
-    """
-    global _S3_CACHE
-    if _S3_CACHE is not None:
-        return _S3_CACHE
-
-    disable_config = _S3_CACHE_CONFIG.get('disable')
-    disable_env = str(os.environ.get(S3_CACHE_DISABLE_ENV, '0')).lower() in ('1', 'true', 'yes')
-    if disable_config is None:
-        disable_flag = disable_env
-    else:
-        disable_flag = disable_config
-
-    if disable_flag:
-        return None
-
-    try:
-        import diskcache
-    except ModuleNotFoundError:
-        logging.debug('diskcache is not installed; S3 disk caching is disabled.')
-        return None
+    _S3_CACHE_BACKEND_AVAILABLE = True
 
     cache_dir = _S3_CACHE_CONFIG.get('cache_dir')
     if cache_dir is None:
@@ -277,6 +363,9 @@ def configure_s3_cache(cache_dir: Optional[Union[str, Path]] = None, size_gb: Op
     if _S3_CACHE_CONFIG == new_config:
         return
 
+    # Stop and drain async writer queue so it won't write into a soon-to-be-closed cache object.
+    _shutdown_s3_cache_write_worker(drain=True)
+
     if _S3_CACHE is not None:
         try:
             _S3_CACHE.close()
@@ -298,8 +387,18 @@ def _prepare_audio_source(audio_reference):
 
     if isinstance(audio_reference, str):
         audio_path = audio_reference
-        if is_s3_url(audio_reference):
-            audio_obj = _download_audio_from_s3(audio_reference)
+
+        # 1) Prefer mounted local fallback if configured and present.
+        local_fallback = _resolve_local_audio_fallback_path(audio_reference)
+        if local_fallback is not None:
+            audio_obj = local_fallback
+            audio_path = local_fallback
+        else:
+            # 2) Otherwise, normalize URI scheme and perform remote fetch when applicable.
+            remote_audio_path = _normalize_remote_audio_uri(audio_reference)
+            audio_path = remote_audio_path
+            if is_s3_url(remote_audio_path):
+                audio_obj = _download_audio_from_s3(remote_audio_path)
     else:
         audio_path = getattr(audio_reference, 'name', None)
 

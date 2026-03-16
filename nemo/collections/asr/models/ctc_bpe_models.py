@@ -141,6 +141,16 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             self, dataset, config, shuffle
         )
 
+        num_workers = int(config.get('num_workers', 0))
+        dataloader_kwargs = {}
+        if num_workers > 0:
+            prefetch_factor = config.get('prefetch_factor', None)
+            if prefetch_factor is not None:
+                dataloader_kwargs['prefetch_factor'] = prefetch_factor
+            persistent_workers = config.get('persistent_workers', None)
+            if persistent_workers is not None:
+                dataloader_kwargs['persistent_workers'] = persistent_workers
+
         return torch.utils.data.DataLoader(
             dataset=dataset,
             batch_size=dataloader_batch_size,
@@ -149,8 +159,9 @@ class EncDecCTCModelBPE(EncDecCTCModel, ASRBPEMixin):
             collate_fn=collate_fn,
             drop_last=dataloader_drop_last,
             shuffle=shuffle if sampler is None and batch_sampler is None else False,
-            num_workers=config.get('num_workers', 0),
+            num_workers=num_workers,
             pin_memory=config.get('pin_memory', False),
+            **dataloader_kwargs,
         )
 
     def _setup_transcribe_dataloader(self, config: Dict) -> 'torch.utils.data.DataLoader':
