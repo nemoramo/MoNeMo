@@ -203,6 +203,22 @@ def launch_parallel_streaming(
     return multispk_asr_streamer
 
 
+def _load_diar_model(cfg, map_location):
+    if cfg.diar_model is not None:
+        if cfg.diar_model.endswith(".ckpt"):
+            return SortformerEncLabelModel.load_from_checkpoint(
+                checkpoint_path=cfg.diar_model, map_location=map_location, strict=False
+            )
+        if cfg.diar_model.endswith(".nemo"):
+            return SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model, map_location=map_location)
+        raise ValueError("cfg.diar_model must end with .ckpt or .nemo!")
+
+    if cfg.diar_pretrained_name is not None:
+        return SortformerEncLabelModel.from_pretrained(cfg.diar_pretrained_name)
+
+    raise ValueError("Both cfg.diar_model and cfg.pretrained_name cannot be None!")
+
+
 @hydra_runner(config_name="MultitalkerTranscriptionConfig", schema=MultitalkerTranscriptionConfig)
 def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionConfig]:
     for key in cfg:
@@ -239,14 +255,7 @@ def main(cfg: MultitalkerTranscriptionConfig) -> Union[MultitalkerTranscriptionC
         accelerator = 'gpu'
         map_location = torch.device(f'cuda:{cfg.cuda}')
 
-    if cfg.diar_model.endswith(".ckpt"):
-        diar_model = SortformerEncLabelModel.load_from_checkpoint(
-            checkpoint_path=cfg.diar_model, map_location=map_location, strict=False
-        )
-    elif cfg.diar_model.endswith(".nemo"):
-        diar_model = SortformerEncLabelModel.restore_from(restore_path=cfg.diar_model, map_location=map_location)
-    else:
-        raise ValueError("cfg.diar_model must end with.ckpt or.nemo!")
+    diar_model = _load_diar_model(cfg, map_location)
 
     # Model setup for inference
     trainer = pl.Trainer(devices=device, accelerator=accelerator)
